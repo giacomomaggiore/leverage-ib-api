@@ -23,8 +23,8 @@ Rebalancing triggers:
 Pipeline
 --------
 1. Download 5y daily OHLCV via yfinance → data/
-2. Compute log-returns and Ledoit-Wolf covariance
-3. Optimize weights (min-var, max-Sharpe, market-cap)
+2. Compute covariances from returns (PyPortfolioOpt risk models)
+3. Optimize weights with PyPortfolioOpt (min-vol, max-Sharpe); expected returns via mean_historical_return on prices (simple returns)
 4. Backtest: monthly rebalance loop, 2x leverage, margin interest deducted
 5. Monte Carlo: block bootstrap, collect return distribution
 6. Pick best strategy
@@ -34,7 +34,7 @@ Pipeline
 
 Covariance Models (Theory, Intuition, When to Use)
 --------------------------------------------------
-Portfolio optimizers depend critically on the return covariance matrix. This repo supports multiple estimators via the `cov_method` parameter in `min_variance` and `max_sharpe`:
+Portfolio optimizers depend critically on the return covariance matrix. This repo supports multiple estimators via the `cov_method` parameter in `min_variance` and `max_sharpe` (backed by PyPortfolioOpt):
 
 - `shrunk` (default): Ledoit–Wolf shrinkage toward a scaled identity
 - `empirical`: plain sample covariance
@@ -98,6 +98,11 @@ min_variance(tickers, as_of=dt, cov_method='factor', cov_params={'n_factors': 3}
 # Max-Sharpe mirrors the same interface
 max_sharpe(tickers, as_of=dt, cov_method='shrunk')
 ```
+
+PyPortfolioOpt specifics
+- Expected returns: `pypfopt.expected_returns.mean_historical_return(prices, frequency=252, log_returns=False)` (simple returns on adjusted-close prices, annualized).
+- Covariance (returns): `pypfopt.risk_models.sample_cov`, `CovarianceShrinkage(...).ledoit_wolf()`, `CovarianceShrinkage(...).oracle_approximating()`, or `exp_cov(..., span=s)` depending on `cov_method`.
+- Optimization: `EfficientFrontier.min_volatility()` and `EfficientFrontier.max_sharpe(risk_free_rate=rf)` under long-only, fully-invested constraints.
 
 Troubleshooting equal-weight outcomes
 - Cause: With strong shrinkage and similar variances, Σ̂ ≈ c·I; under long-only + sum-to-1, min-variance → equal-weight.

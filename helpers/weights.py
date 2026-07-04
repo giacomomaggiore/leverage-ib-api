@@ -1,10 +1,9 @@
 import numpy as np
 import pandas as pd
-import cvxpy as cp
-from scipy.optimize import minimize
 from datetime import date
 from dateutil.relativedelta import relativedelta
-from sklearn.covariance import OAS
+from pypfopt import risk_models, expected_returns
+from pypfopt.efficient_frontier import EfficientFrontier
 
 from helpers.fetch import load_data
 from helpers.stats import log_returns, covariance_shrunk
@@ -34,6 +33,26 @@ def _returns(tickers: list[str], as_of: date, timeframe_years: int) -> pd.DataFr
     return log_returns(prices)
 
 
+def _prices(tickers: list[str], as_of: date, timeframe_years: int) -> pd.DataFrame:
+    start = (as_of - relativedelta(years=timeframe_years)).strftime("%Y-%m-%d")
+    end = as_of.strftime("%Y-%m-%d")
+
+    series: dict[str, pd.Series] = {}
+    for t in tickers:
+        s = load_data(t, start, end)["adj close"].dropna()
+        if s.shape[0] >= 2:
+            series[t] = s
+
+    if not series:
+        return pd.DataFrame()
+
+    prices = pd.concat(series.values(), axis=1, join="inner")
+    prices.columns = list(series.keys())
+    if prices.shape[0] < 2 or prices.shape[1] == 0:
+        return pd.DataFrame()
+    return prices
+
+
 def min_variance(
     tickers: list[str],
     as_of: date = None,
@@ -50,28 +69,23 @@ def min_variance(
     if rets is None or rets.shape[0] == 0 or len(avail) == 0:
         raise ValueError(f"No usable return observations for optimisation window ending {as_of}.")
 
+    # Covariance matrix (daily) via PyPortfolioOpt risk models (using returns)
     sigma = _compute_covariance(rets, method=cov_method, params=cov_params)
-    sigma = np.asarray(sigma, dtype=float)
-    if sigma.ndim == 0:
-        sigma = sigma.reshape(1, 1)
-    elif sigma.ndim == 1:
-        sigma = np.diag(sigma)
 
-    # Ensure weight cap is feasible given number of assets
-    cap = max(max_weight, 1.0 / len(avail))
+    # Expected returns from prices using PyPortfolioOpt (simple returns, annualized)
+    prices = _prices(tickers, as_of, timeframe_years)
+    mu = expected_returns.mean_historical_return(prices, frequency=252, log_returns=False)
 
-    # Minimise variance via SLSQP with box constraints and full-investment
-    def var_obj(w):
-        return float(w @ sigma @ w)
+    # Preserve previous behavior: long-only with no per-asset cap by default
+    ef = EfficientFrontier(expected_returns=mu, cov_matrix=sigma, weight_bounds=(0.0, 1.0))
 
-    n = len(avail)
-    x0 = np.ones(n) / n
-    bounds = [(0.0, cap)] * n
-    cons = ({"type": "eq", "fun": lambda w: w.sum() - 1.0},)
-    res = minimize(var_obj, x0=x0, method="SLSQP", bounds=bounds, constraints=cons)
+    # Minimise portfolio volatility
+    ef.min_volatility()
+    w = ef.clean_weights()
 
     out = pd.Series(0.0, index=tickers)
-    out.loc[avail] = res.x
+    for t in avail:
+        out.loc[t] = float(w.get(t, 0.0))
     return out
 
 
@@ -92,42 +106,24 @@ def max_sharpe(
     if rets is None or rets.shape[0] == 0 or len(avail) == 0:
         raise ValueError(f"No usable return observations for optimisation window ending {as_of}.")
 
+    # Covariance matrix (daily) via PyPortfolioOpt risk models
     sigma = _compute_covariance(rets, method=cov_method, params=cov_params)
-    sigma = np.asarray(sigma, dtype=float)
-    if sigma.ndim == 0:
-        sigma = sigma.reshape(1, 1)
-    elif sigma.ndim == 1:
-        sigma = np.diag(sigma)
-    mu = rets.mean().values * 252  # annualised expected returns
+    # Expected returns from prices using PyPortfolioOpt (simple returns, annualized)
+    prices = _prices(tickers, as_of, timeframe_years)
+    mu = expected_returns.mean_historical_return(prices, frequency=252, log_returns=False)
 
-    def neg_sharpe(w):
-        # annualised Sharpe — sigma is daily so vol scales by sqrt(252)
-        # mu @ w is the expected return of the portfolio
-        # rf is the risk-free rate
-        # w @ sigma @ w gives the portfolio variance. 
-        # 
-        # The negative sign is used because we want to maximize the Sharpe ratio, but the optimizer minimizes functions.
-        return -(mu @ w - rf) / np.sqrt(w @ sigma @ w * 252)
-
-    # minimize the negative Sharpe ratio 
-    # subject to full investment and weight cap
-    # Ensure weight cap is feasible given number of assets
-    cap = max(max_weight, 1.0 / len(avail))
-
-    result = minimize(
-        neg_sharpe,
-        x0=np.ones(len(avail)) / len(avail),
-        method="SLSQP",
-        bounds=[(0, cap)] * len(avail),
-        constraints={"type": "eq", "fun": lambda w: w.sum() - 1},
-    )
+    # Preserve previous behavior: long-only with no per-asset cap by default
+    ef = EfficientFrontier(expected_returns=mu, cov_matrix=sigma, weight_bounds=(0.0, 1.0))
+    ef.max_sharpe(risk_free_rate=rf)
+    w = ef.clean_weights()
 
     out = pd.Series(0.0, index=tickers)
-    out.loc[avail] = result.x
+    for t in avail:
+        out.loc[t] = float(w.get(t, 0.0))
     return out
 
 
-def _compute_covariance(rets: pd.DataFrame, method: str, params: dict | None) -> np.ndarray:
+def _compute_covariance(rets: pd.DataFrame, method: str, params: dict | None) -> pd.DataFrame:
     """Compute covariance matrix from returns with multiple methods.
 
     method:
@@ -141,31 +137,30 @@ def _compute_covariance(rets: pd.DataFrame, method: str, params: dict | None) ->
         params = {}
 
     if method == "shrunk":
-        return covariance_shrunk(rets).values
+        # Ledoit–Wolf shrinkage via PyPortfolioOpt
+        cs = risk_models.CovarianceShrinkage(rets, returns_data=True)
+        mat = cs.ledoit_wolf()
+        return mat if isinstance(mat, pd.DataFrame) else pd.DataFrame(mat, index=rets.columns, columns=rets.columns)
 
     if method == "empirical":
-        return rets.cov().values
+        cov = risk_models.sample_cov(rets, returns_data=True)
+        return cov if isinstance(cov, pd.DataFrame) else pd.DataFrame(cov, index=rets.columns, columns=rets.columns)
 
     if method == "oas":
-        cov = OAS().fit(rets.values).covariance_
-        return cov
+        cs = risk_models.CovarianceShrinkage(rets, returns_data=True)
+        # Oracle Approximating Shrinkage
+        mat = cs.oracle_approximating()
+        return mat if isinstance(mat, pd.DataFrame) else pd.DataFrame(mat, index=rets.columns, columns=rets.columns)
 
     if method == "ewma":
         alpha = params.get("alpha")
         span = params.get("span")
-        if alpha is None:
-            if span is None:
-                span = 60  # ~3 months of daily data
-            alpha = 2.0 / (span + 1.0)
-        x = rets.values
-        n, k = x.shape
-        # weights: older get lower weight; sum to 1
-        w = (1 - alpha) ** np.arange(n - 1, -1, -1, dtype=float)
-        w /= w.sum()
-        mu = (w[:, None] * x).sum(axis=0)
-        xc = x - mu
-        cov = np.einsum('ti,tj,t->ij', xc, xc, w)
-        return cov
+        if span is None and alpha is not None and alpha > 0:
+            span = 2.0 / alpha - 1.0
+        if span is None:
+            span = 60  # ~3 months of daily data by default
+        cov = risk_models.exp_cov(rets, span=int(span), returns_data=True)
+        return cov if isinstance(cov, pd.DataFrame) else pd.DataFrame(cov, index=rets.columns, columns=rets.columns)
 
     if method == "factor":
         n_f = int(params.get("n_factors", 3))
@@ -185,6 +180,6 @@ def _compute_covariance(rets: pd.DataFrame, method: str, params: dict | None) ->
         resid = x0 - X_hat
         spec_var = resid.var(axis=0, ddof=1)
         cov = B @ Fcov @ B.T + np.diag(spec_var)
-        return cov
+        return pd.DataFrame(cov, index=rets.columns, columns=rets.columns)
 
     raise ValueError("cov_method must be one of: 'shrunk', 'empirical', 'oas', 'ewma', 'factor'")
