@@ -7,7 +7,7 @@ from pathlib import Path
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 
 
-def download(ticker: str, start: str, end: str) -> pd.DataFrame:
+def load_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     path = DATA_DIR / f"{ticker}.csv"
     req_start, req_end = pd.Timestamp(start), pd.Timestamp(end)
 
@@ -15,6 +15,7 @@ def download(ticker: str, start: str, end: str) -> pd.DataFrame:
         existing = pd.read_csv(path, index_col=0, parse_dates=True)
         ex_start, ex_end = existing.index.min(), existing.index.max()
 
+        # fetch only the gaps outside the already-stored range
         chunks = [existing]
         if req_start < ex_start:
             chunks.insert(0, _fetch(ticker, start, (ex_start - pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
@@ -29,6 +30,16 @@ def download(ticker: str, start: str, end: str) -> pd.DataFrame:
         existing.to_csv(path)
 
     return existing.loc[req_start:req_end]
+
+
+def common_window(tickers: list[str]) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return (start, end) of the largest date range covered by all tickers in /data/."""
+    starts, ends = [], []
+    for t in tickers:
+        df = pd.read_csv(DATA_DIR / f"{t}.csv", index_col=0, parse_dates=True)
+        starts.append(df.index.min())
+        ends.append(df.index.max())
+    return max(starts), min(ends)
 
 
 def _fetch(ticker: str, start: str, end: str) -> pd.DataFrame:

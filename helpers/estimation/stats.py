@@ -17,5 +17,11 @@ def covariance(returns: pd.DataFrame) -> pd.DataFrame:
 
 
 def covariance_shrunk(returns: pd.DataFrame) -> pd.DataFrame:
+    if returns is None or returns.shape[0] == 0:
+        raise ValueError(
+            f"No return observations provided to covariance_shrunk (shape={None if returns is None else returns.shape})."
+            " Check the requested date window and source data files."
+        )
+
     lw = LedoitWolf().fit(returns)
     return pd.DataFrame(lw.covariance_, index=returns.columns, columns=returns.columns)
