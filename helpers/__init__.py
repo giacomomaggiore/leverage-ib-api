@@ -1,11 +1,25 @@
-"""Helpers package for leverage-ib-api project.
+"""Helpers package exports.
 
-Subpackages:
-- montecarlo
-- download
-- estimation
-- backtest
-- ib
-
-Keep modules lightweight and educational.
+Public API:
+- Data IO: `load_data`, `common_window`
+- Stats: `log_returns`, `covariance`, `covariance_shrunk`, `sharpe`
+- Optimization: `min_variance`, `max_sharpe`
 """
+
+from .fetch import load_data, common_window
+from .stats import log_returns, covariance, covariance_shrunk, sharpe
+from .weights import min_variance, max_sharpe
+
+__all__ = [
+	# data
+	"load_data",
+	"common_window",
+	# stats
+	"log_returns",
+	"covariance",
+	"covariance_shrunk",
+	"sharpe",
+	# optimization
+	"min_variance",
+	"max_sharpe",
+]
