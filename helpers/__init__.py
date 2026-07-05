@@ -3,12 +3,12 @@
 Public API:
 - Data IO: `load_data`, `common_window`
 - Stats: `log_returns`, `covariance`, `covariance_shrunk`, `sharpe`
-- Optimization: `min_variance`, `max_sharpe`
+- Optimization: `min_variance`, `max_sharpe`, `drop_near_duplicates`
 """
 
 from .fetch import load_data, common_window
 from .stats import log_returns, covariance, covariance_shrunk, sharpe
-from .weights import min_variance, max_sharpe
+from .weights import min_variance, max_sharpe, drop_near_duplicates
 
 __all__ = [
 	# data
@@ -22,4 +22,5 @@ __all__ = [
 	# optimization
 	"min_variance",
 	"max_sharpe",
+    "drop_near_duplicates",
 ]

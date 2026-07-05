@@ -45,14 +45,18 @@ Portfolio optimizers depend critically on the return covariance matrix. This rep
 Each method trades bias vs variance differently. Below is a practical guide.
 
 Empirical (sample) covariance — `cov_method='empirical'`
-- Definition: S = (1/(T-1)) Σ_t (r_t − μ)(r_t − μ)^T
+ - Definition:
+
+    $$S = \frac{1}{T-1}\sum_t (r_t - \mu)(r_t - \mu)^\top$$
 - Intuition: Uses only in-sample co-movements; no regularization.
 - Pros: Preserves true cross-asset structure; differentiates assets strongly.
 - Cons: Noisy/ill-conditioned when lookback T is short relative to number of assets N; can produce unstable/extreme weights.
 - Use when: You have ample history vs asset count, accept more variability for higher fidelity to observed correlations.
 
 Ledoit–Wolf shrinkage — `cov_method='shrunk'`
-- Definition: Σ̂ = (1 − α) S + α μ I (α auto-chosen; μ often trace(S)/N)
+ - Definition:
+
+    $$\hat{\Sigma} = (1-\alpha) S + \alpha \mu I \quad (\alpha\ \text{auto-chosen};\ \mu = \mathrm{tr}(S)/N)$$
 - Intuition: Pulls estimates toward a spherical target to reduce sampling noise and improve conditioning.
 - Pros: Stabler optimizer, fewer pathologies from noisy S; no hyperparameters.
 - Cons: Can “wash out” correlation structure; when off-diagonals are small and variances similar, min-variance tends toward equal-weight under long-only constraints.
@@ -66,7 +70,11 @@ OAS (Oracle Approximating Shrinkage) — `cov_method='oas'`
 - Use when: You want a robust, parameter-free shrinker; try this if LW produces overly uniform weights.
 
 EWMA (Exponentially Weighted) — `cov_method='ewma'` with `cov_params={'alpha': a}` or `{'span': s}`
-- Definition (conceptually): recent returns get more weight; effective Cov = Σ_t w_t (r_t − μ)(r_t − μ)^T with decaying weights.
+ - Definition (conceptually): recent returns get more weight; effective covariance:
+
+    $$\mathrm{Cov} = \sum_t w_t (r_t - \mu)(r_t - \mu)^\top$$
+
+    with decaying weights.
 - Intuition: Emphasizes the recent regime; adapts to changing vol/correlation faster than static windows.
 - Pros: Captures time-variation; can reduce stale-risk during regime shifts.
 - Cons: More parameter sensitivity (α or span); can underuse older data and be noisier if span is too short.
@@ -75,7 +83,11 @@ EWMA (Exponentially Weighted) — `cov_method='ewma'` with `cov_params={'alpha':
 Factor (PCA) model — `cov_method='factor'` with `cov_params={'n_factors': k}`
 - Construction (outline):
     - Demean returns and take SVD/PCA → top k factors (scores) and loadings.
-    - Rebuild Σ̂ = B Σ_F Bᵀ + D, where B are loadings, Σ_F factor covariance, D diagonal of specific variances.
+        - Rebuild
+
+            $$\hat{\Sigma} = B \Sigma_F B^\top + D$$
+
+            where $B$ are loadings, $\Sigma_F$ factor covariance, $D$ diagonal of specific variances.
 - Intuition: Most co-movement is driven by a few latent factors; model common risk parsimoniously, reduce noise elsewhere.
 - Pros: Good stability with retained structure; tunable complexity via `n_factors`.
 - Cons: Choice of k matters; purely statistical (no economic labeling by default).
@@ -86,6 +98,9 @@ Choosing a method (practical tips)
 - If weights look jumpy, prefer `oas`, `shrunk`, or `factor` (small `n_factors`).
 - Increase lookback or rebalance on business-month-start (`BMS`) to improve estimation and reduce NaNs.
 - Check constraints: tight per-asset caps push solutions toward uniform weights when assets look similar.
+ - Prefer well-conditioned Σ: set `cov_method='oas'` or `'shrunk'`; or use `'factor'` with `cov_params={'n_factors': 2–4}` to retain structure while reducing noise.
+ - Optional ridge (jitter): improve conditioning by adding a tiny diagonal term via `cov_params={'jitter': 1e-8}`.
+ - Remove near-duplicates: avoid including aggregate ETFs (e.g., `AGG`) together with their sleeve constituents (e.g., `VGSH`, `IEF`, `VGLT`, `TLH`).
 
 Code usage
 ```
@@ -103,10 +118,11 @@ PyPortfolioOpt specifics
 - Expected returns: `pypfopt.expected_returns.mean_historical_return(prices, frequency=252, log_returns=False)` (simple returns on adjusted-close prices, annualized).
 - Covariance (returns): `pypfopt.risk_models.sample_cov`, `CovarianceShrinkage(...).ledoit_wolf()`, `CovarianceShrinkage(...).oracle_approximating()`, or `exp_cov(..., span=s)` depending on `cov_method`.
 - Optimization: `EfficientFrontier.min_volatility()` and `EfficientFrontier.max_sharpe(risk_free_rate=rf)` under long-only, fully-invested constraints.
+ - Extras: You can pass `cov_params` to tweak estimators; this repo supports `{'span': s}` (EWMA), `{'n_factors': k}` (factor), and `{'jitter': 1e-8}` to add a small diagonal ridge for numerical stability.
 
 Troubleshooting equal-weight outcomes
-- Cause: With strong shrinkage and similar variances, Σ̂ ≈ c·I; under long-only + sum-to-1, min-variance → equal-weight.
-- Remedies: Switch to `empirical`/`oas`/`ewma`, increase lookback, relax caps, or use `factor` with small `n_factors`.
+ - Cause: With strong shrinkage and similar variances, $\hat{\Sigma} \approx cI$; under long-only + sum-to-1, min-variance → equal-weight.
+ - Remedies: Switch to `empirical`/`oas`/`ewma`, increase lookback, relax caps, or use `factor` with small `n_factors`.
 
 ---
 
