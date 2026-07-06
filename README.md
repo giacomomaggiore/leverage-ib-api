@@ -126,33 +126,40 @@ Troubleshooting equal-weight outcomes
 
 ---
 
-Live trading notes
-------------------
-- Run manually from laptop with IB Gateway open (paper account, port 4002)
-- Before placing orders: query current IB positions and compute delta
-- Circuit breaker: if leverage drifts >10% from target, rebalance immediately
+Clustering Methodology
+----------------------
+Before optimization, the ETF universe can be reduced by clustering highly similar ETFs and selecting one representative per cluster.
 
----
+Inputs:
+- Universe CSV: first column is the ticker, second column is AUM in millions of USD.
+- Price files: one CSV per ticker in `data/`, named `{ticker}.csv`, with columns `date` and `adj close`.
 
-Repo structure
---------------
-    data/                   downloaded CSVs (gitignored)
-    helpers/
-        data/               yfinance download
-        estimation/         returns, covariance
-        optimization/       min-variance, max-Sharpe, market-cap
-        backtest/           rebalance loop, leverage tracking
-        montecarlo/         block bootstrap
-        ib/                 IB connector, position reconciliation, order placement
-    main.ipynb              orchestration notebook
-    requirements.txt
+Method:
+1. Load the universe mapping from `data/etf_universe.csv`.
+2. Load each ticker price history from `data/{ticker}.csv`.
+3. Filter out ETFs with less than 6 years of history by default.
+4. Align all remaining ETFs on common dates.
+5. Compute daily simple returns.
+6. Compute the return correlation matrix.
+7. Convert correlation into distance using `1 - |corr|` by default.
+8. Run hierarchical clustering with average linkage.
+9. Select the largest-AUM ETF inside each cluster.
 
----
+Rationale:
+- Reduces duplicate exposures such as overlapping equity or bond ETFs.
+- Improves covariance conditioning by removing near-identical assets.
+- Keeps the universe investable by preferring larger, more liquid ETFs.
+- Preserves broad market coverage while reducing optimizer noise.
 
-Setup
------
-    python3 -m venv .venv
-    source .venv/bin/activate
-    pip install -r requirements.txt
+Usage:
+```python
+from helpers.clustering import cluster_select_representatives_from_csv
 
-For live trading: start IB Gateway (paper, port 4002) before running the notebook.
+selected_tickers, clusters = cluster_select_representatives_from_csv(
+    universe_csv_path="data/etf_universe.csv",
+    data_dir="data",
+    n_clusters=20,
+    min_history_years=6,
+)
+
+selected_tickers

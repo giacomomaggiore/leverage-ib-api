@@ -23,9 +23,7 @@ def load_data(ticker: str, start: str, end: str) -> pd.DataFrame:
             # Existing file is empty — fetch fresh data for the requested window
             existing = _fetch(ticker, start, end)
             existing.to_csv(path)
-        else:
-            existing = _ensure_adj_close_only(existing, inplace_path=path)
-
+        
         # If after normalization the file is effectively empty, refetch for window
         if existing is None or existing.shape[0] == 0 or existing.shape[1] == 0:
             existing = _fetch(ticker, start, end)

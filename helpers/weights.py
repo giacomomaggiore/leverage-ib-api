@@ -140,7 +140,7 @@ def max_sharpe(
             
             ef = EfficientFrontier(expected_returns=mu, cov_matrix=sigma, weight_bounds=(0.0, 1.0))
             ef.max_quadratic_utility(risk_aversion=1.0)
-            print("Warning: max_sharpe failed, falling back to max_quadratic_utility.")
+            print("max_sharpe failed, falling back to max_quadratic_utility.")
             last_err = None
         except Exception as e1:
             last_err = e1
@@ -150,7 +150,7 @@ def max_sharpe(
         try:
             ef = EfficientFrontier(expected_returns=mu, cov_matrix=sigma, weight_bounds=(0.0, 1.0))
             ef.min_volatility()
-            print("Warning: max_sharpe failed, falling back to min_volatility.")
+            print("max_sharpe failed, falling back to min_volatility.")
             last_err = None
         except Exception as e2:
             last_err = e2
