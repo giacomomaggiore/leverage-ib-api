@@ -3,7 +3,7 @@
 Public API:
 - Data IO: `load_data`, `common_window`
 - Stats: `log_returns`, `covariance`, `covariance_shrunk`, `sharpe`
-- Optimization: `min_variance`, `max_sharpe`, `drop_near_duplicates`
+- Optimization: `min_variance`, `max_sharpe`, 
 """
 
 from .fetch import load_data, common_window

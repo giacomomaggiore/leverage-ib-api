@@ -73,31 +73,3 @@ def _fetch(ticker: str, start: str, end: str) -> pd.DataFrame:
     ser = s.to_frame()
     ser.index.name = "date"
     return ser
-
-
-def _ensure_adj_close_only(df: pd.DataFrame, inplace_path: Path | None = None) -> pd.DataFrame:
-    """Ensure a DataFrame has a single 'adj close' column; optionally persist changes.
-
-    Accepted input columns (priority order): 'Adj Close', 'adj close', 'adj_close',
-    'close', 'Close'. If none found, returns the input as-is.
-    """
-    col = None
-    cols_lower = {c.lower(): c for c in df.columns}
-
-    for cand in ["adj close", "adj_close", "adjclose", "adj. close", "adj. close.", "adjcls", "adjclose*", "adjclose ", "adj close ", "adj. close ", "adjclose-adjusted", "adj_close_price", "adj_close_px", "adj_closevalue", "adjcloseprice", "adjclose_px", "adj close price", "adj close px", "adj price", "adj cls", "adjcls price", "adjcls px", "adj","adj.", "adj. cls", "adj-cls", "adjClose", "adjclose"]:
-        if cand in cols_lower:
-            col = cols_lower[cand]
-            break
-    if col is None:
-        for cand in ["Adj Close", "Close", "close"]:
-            if cand in df.columns:
-                col = cand
-                break
-
-    if col is None:
-        return df
-
-    out = df[[col]].rename(columns={col: "adj close"})
-    if inplace_path is not None:
-        out.to_csv(inplace_path)
-    return out

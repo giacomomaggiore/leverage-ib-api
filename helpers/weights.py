@@ -117,9 +117,9 @@ def max_sharpe(
     # robust sequence of solvers with generous iteration budgets.
     last_err: Exception | None = None
     for solver, kwargs in [
-        ("ECOS", {"max_iters": 30000}),
-        ("CLARABEL", {"max_iter": 50000, "time_limit": 60.0}),
-        ("SCS", {"max_iters": 80000}),
+        ("ECOS", {"max_iters": 50000}),
+        ("CLARABEL", {"max_iter": 80000, "time_limit": 120.0}),
+        ("SCS", {"max_iters": 100000}),
         (None, {}),  # let CVXPY choose as a final attempt
     ]:
         try:
@@ -137,8 +137,10 @@ def max_sharpe(
     if last_err is not None:
         # Fallback 1: maximize quadratic utility as a proxy for Sharpe
         try:
+            
             ef = EfficientFrontier(expected_returns=mu, cov_matrix=sigma, weight_bounds=(0.0, 1.0))
             ef.max_quadratic_utility(risk_aversion=1.0)
+            print("Warning: max_sharpe failed, falling back to max_quadratic_utility.")
             last_err = None
         except Exception as e1:
             last_err = e1
@@ -148,6 +150,7 @@ def max_sharpe(
         try:
             ef = EfficientFrontier(expected_returns=mu, cov_matrix=sigma, weight_bounds=(0.0, 1.0))
             ef.min_volatility()
+            print("Warning: max_sharpe failed, falling back to min_volatility.")
             last_err = None
         except Exception as e2:
             last_err = e2
@@ -238,17 +241,3 @@ def _compute_covariance(rets: pd.DataFrame, method: str, params: dict | None) ->
         cov = pd.DataFrame(arr, index=cov.index, columns=cov.columns)
     return cov
 
-
-def drop_near_duplicates(tickers: list[str]) -> list[str]:
-    """Drop known overlapping aggregate ETFs when components are present.
-
-    Rules:
-    - If 'AGG' is present alongside any treasury sleeves (VGSH/IEF/VGLT/TLH), drop 'AGG'.
-    Extend rules here as needed.
-    """
-    s = set(tickers)
-    sleeves = {"VGSH", "IEF", "VGLT", "TLH"}
-    if "AGG" in s and len(sleeves & s) > 0:
-        s.discard("AGG")
-    # Return in original order, filtered
-    return [t for t in tickers if t in s]
