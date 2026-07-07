@@ -163,3 +163,79 @@ selected_tickers, clusters = cluster_select_representatives_from_csv(
 )
 
 selected_tickers
+
+---
+
+Recent Work (what I changed)
+----------------------------
+- `helpers/fetch.py`
+    - Improved robustness when downloading with `yfinance`: catches download errors, returns empty DataFrames on failure, and avoids overwriting existing CSVs with empty results.
+    - Suppresses noisy `yfinance` stdout/stderr messages during download to keep notebook output clean.
+    - Filters empty fetch chunks before concatenation when updating local CSVs.
+
+- `helpers/clustering.py`
+    - Added `visualize_clusters(clusters, corr=None, returns=None, ...)` which computes a 2D embedding of tickers and plots them colored by cluster. Uses MDS (via `sklearn.manifold.MDS`) on a distance matrix derived from correlations (default `1 - |corr|`). Returns `(fig, ax)` for further customization or saving.
+
+- `main.ipynb`
+    - Inserted an example notebook cell that runs `cluster_select_representatives_from_csv(...)`, builds aligned returns for the clustered tickers and calls `visualize_clusters(...)` to render the plot.
+
+Why these changes?
+- Make data fetching more robust and idempotent so repeated notebook runs don't clobber existing data or print confusing warnings from upstream libraries.
+- Provide a lightweight visual tool to inspect cluster structure before/after representative selection so you can study which ETFs were grouped together and why.
+
+How to reproduce the visualization quickly
+---------------------------------------
+In a notebook cell (this is the example I added to `main.ipynb`):
+
+```python
+from helpers.clustering import cluster_select_representatives_from_csv, visualize_clusters
+from helpers.fetch import load_data
+import pandas as pd
+
+ETF_UNIVERSE_CSV_PATH = "data/etf_universe.csv"
+selected, clusters = cluster_select_representatives_from_csv(ETF_UNIVERSE_CSV_PATH)
+
+# build aligned price matrix for tickers in the clusters
+tickers = sorted([t for members in clusters.values() for t in members])
+start_date = '2012-01-01'
+end_date = pd.Timestamp.today().strftime('%Y-%m-%d')
+prices = pd.concat([load_data(t, start_date, end_date)['adj close'].rename(t) for t in tickers], axis=1, join='inner')
+returns = prices.pct_change().dropna()
+
+# show the cluster plot
+fig, ax = visualize_clusters(clusters, returns=returns)
+fig
+```
+
+Technical: Multi-Dimensional Scaling (MDS)
+---------------------------------------
+Purpose
+- MDS is a family of techniques that embed objects described by pairwise dissimilarities (distances) into a low-dimensional Euclidean space so that the pairwise Euclidean distances in the embedding approximate the original dissimilarities.
+
+Two common variants
+- Classical MDS (metric / Torgerson scaling): computes an exact embedding from a Euclidean distance matrix using linear algebra (double-centering). If the input dissimilarities are true Euclidean distances, classical MDS recovers coordinates (up to rotation/reflection and translation).
+    - Algorithm (brief): given squared distance matrix D^{(2)}, compute B = -0.5 * J D^{(2)} J where J = I - (1/n)11^T. Eigen-decompose B = V Λ V^T and take embedding X = V_k Λ_k^{1/2} using the top k positive eigenvalues.
+
+- Metric MDS (stress-minimizing, as implemented in `sklearn.manifold.MDS`): iteratively optimizes a low-dimensional configuration to minimize a stress function (discrepancy between original dissimilarities and embedding distances). It is more flexible (works with non-Euclidean dissimilarities) but is iterative and can be slower.
+
+Practical notes for this project
+- We convert correlation → distance using either `1 - corr` or `1 - |corr|`. This produces a symmetric dissimilarity matrix with zeros on the diagonal and values in [0,2]. Treating correlation-based distances with MDS gives a geometric view of similarity: nearby points have stronger (absolute) correlations.
+- The implementation uses `sklearn.manifold.MDS` with `dissimilarity='precomputed'`. That performs metric MDS that minimizes stress. By default it initializes randomly; consider `init='classical'` or setting `random_state` for reproducible layouts.
+- Complexity: constructing the full distance matrix is O(n^2) memory/time. MDS itself scales poorly beyond a few hundred points (stress minimization is iterative). For very large universes prefer dimensionality reduction by PCA on features or classical MDS on a landmark subset.
+- Interpretation: MDS coordinates are useful for visualization and exploratory analysis (cluster coherence, outliers) but should not be treated as factor returns or direct inputs to optimization without careful validation.
+
+Tuning and alternatives
+- If plotting many tickers produces clutter, use `annotate=False` in `visualize_clusters` and hover-enabled plotting (e.g., Plotly) to inspect points interactively.
+- Alternatives:
+    - PCA on returns or on the double-centered Gram matrix (fast, linear algebra based).
+    - t-SNE or UMAP for non-linear neighborhood-preserving embeddings (better local clustering but more parameters and interpretation challenges).
+
+References
+- Borg, I., & Groenen, P. J. F. (2005). Modern Multidimensional Scaling: Theory and Applications.
+- sklearn.manifold.MDS documentation: https://scikit-learn.org/stable/modules/generated/sklearn.manifold.MDS.html
+
+---
+If you want, I can also:
+- add PCA / t-SNE options to `visualize_clusters`,
+- add an option to save the plot to file from the helper, or
+- add an interactive Plotly-based visualization cell to the notebook.

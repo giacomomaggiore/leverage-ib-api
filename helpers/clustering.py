@@ -7,6 +7,9 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
 from helpers.fetch import load_data
+import matplotlib.pyplot as plt
+from sklearn.manifold import MDS
+# use pyplot's get_cmap to avoid relying on the cm module implementation
 
 
 def cluster_select_representatives_from_csv(
@@ -51,7 +54,8 @@ def cluster_select_representatives_from_csv(
     # Load or update adjusted-close price histories using the shared fetch helper.
     prices_by_ticker: Dict[str, pd.Series] = {}
     end_date = pd.Timestamp.today().strftime("%Y-%m-%d")
-    start_date = (pd.Timestamp.today() - pd.DateOffset(years=min_history_years + 1)).strftime("%Y-%m-%d")
+    
+    start_date = (pd.Timestamp.today() - pd.DateOffset(years=min_history_years + 5)).strftime("%Y-%m-%d")
 
     for ticker in universe["ticker"]:
         try:
@@ -132,3 +136,75 @@ def cluster_select_representatives_from_csv(
         selected.append(representative)
 
     return selected, clusters
+
+
+def visualize_clusters(
+    clusters: Dict[int, List[str]],
+    corr: Optional[pd.DataFrame] = None,
+    returns: Optional[pd.DataFrame] = None,
+    distance_metric: str = "1-abs_corr",
+    method: str = "mds",
+    figsize: Tuple[int, int] = (10, 8),
+    annotate: bool = True,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """
+    Visualize clustering groups in 2D.
+
+    - `clusters`: mapping label -> list of tickers
+    - Provide either `corr` (DataFrame of correlations) or `returns` (DataFrame of aligned returns)
+    - `distance_metric`: '1-abs_corr' or '1-corr'
+    - `method`: currently only 'mds' is supported (classical MDS via sklearn)
+
+    Returns (fig, ax).
+    """
+    # collect tickers in stable order
+    tickers = []
+    label_of = {}
+    for lbl, members in sorted(clusters.items()):
+        for t in members:
+            label_of[t] = int(lbl)
+            tickers.append(t)
+
+    if corr is None:
+        if returns is None:
+            raise ValueError("Provide either 'corr' or 'returns' to compute embedding")
+        corr = returns.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
+
+    # Ensure correlation matrix covers all tickers in the clusters
+    corr = corr.reindex(index=tickers, columns=tickers).fillna(0.0)
+
+    if distance_metric == "1-corr":
+        dist = 1.0 - corr.values
+    else:
+        dist = 1.0 - np.abs(corr.values)
+
+    np.fill_diagonal(dist, 0.0)
+
+    if method == "mds":
+        mds = MDS(n_components=2, dissimilarity="precomputed", random_state=0)
+        coords = mds.fit_transform(dist)
+    else:
+        raise ValueError("Unsupported embedding method: %s" % method)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    cmap = plt.get_cmap("tab20")
+    labels = [label_of[t] for t in tickers]
+    unique_labels = sorted(set(labels))
+    color_for = {lbl: cmap(i % 20) for i, lbl in enumerate(unique_labels)}
+
+    for t, (x, y) in zip(tickers, coords):
+        lbl = label_of[t]
+        ax.scatter(x, y, color=color_for[lbl], s=70, edgecolors="k", linewidths=0.4)
+        if annotate:
+            ax.text(x + 1e-6, y + 1e-6, t, fontsize=8)
+
+    # build legend
+    handles = [plt.Line2D([0], [0], marker='o', color='w', label=str(lbl),
+                          markerfacecolor=color_for[lbl], markersize=8, markeredgecolor='k')
+               for lbl in unique_labels]
+    ax.legend(handles=handles, title="cluster", bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.set_title("Cluster visualization")
+    ax.set_xlabel("dim1")
+    ax.set_ylabel("dim2")
+    plt.tight_layout()
+    return fig, ax
