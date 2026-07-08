@@ -87,7 +87,7 @@ Factor (PCA) model — `cov_method='factor'` with `cov_params={'n_factors': k}`
 
             $$\hat{\Sigma} = B \Sigma_F B^\top + D$$
 
-            where $B$ are loadings, $\Sigma_F$ factor covariance, $D$ diagonal of specific variances.
+            where $B$ are loadings (matrix of factor loadings: each row is an asset, each column a factor, each entry in the matrix is asset's sensitivity to a factor), $\Sigma_F$ factor covariance, $D$ diagonal of specific variances.
 - Intuition: Most co-movement is driven by a few latent factors; model common risk parsimoniously, reduce noise elsewhere.
 - Pros: Good stability with retained structure; tunable complexity via `n_factors`.
 - Cons: Choice of k matters; purely statistical (no economic labeling by default).
@@ -179,6 +179,19 @@ Recent Work (what I changed)
 - `main.ipynb`
     - Inserted an example notebook cell that runs `cluster_select_representatives_from_csv(...)`, builds aligned returns for the clustered tickers and calls `visualize_clusters(...)` to render the plot.
 
+- `helpers/backtest.py`
+    - Added `backtest_portfolio(weights, start_value=10000.0, returns=None)` to turn any daily weights DataFrame into a portfolio value series. If `returns` is not provided, it loads adjusted-close prices via `load_data` and builds historical daily simple returns.
+
+- `helpers/portfolio.py`
+    - Added `build_portfolios_from_prices(prices, start, end, ...)` to compute dynamic rebalanced weights (min-variance, max-Sharpe, equal-weight proxy) directly from a provided prices matrix. Mirrors the historical pipeline but without fetching.
+
+- `helpers/montecarlo.py`
+    - `simulate_parametric(...)`: multivariate-normal daily return paths estimated from historical mean/cov.
+    - `simulate_bootstrap(...)`: IID or moving-block bootstrap on historical daily returns.
+    - `apply_backtest_to_simulations(...)`: backtest constant weights on each simulated path.
+    - `rebalance_on_simulation(...)`: turn simulated returns → prices, recompute dynamic weights with `build_portfolios_from_prices`, and backtest.
+    - `apply_rebalanced_backtest_to_simulations(...)`: batch version returning `(weights, values)` per simulation.
+
 Why these changes?
 - Make data fetching more robust and idempotent so repeated notebook runs don't clobber existing data or print confusing warnings from upstream libraries.
 - Provide a lightweight visual tool to inspect cluster structure before/after representative selection so you can study which ETFs were grouped together and why.
@@ -207,28 +220,65 @@ fig, ax = visualize_clusters(clusters, returns=returns)
 fig
 ```
 
+Backtesting and Monte Carlo (examples)
+--------------------------------------
+Historical backtest from daily weights:
+
+```python
+from helpers.backtest import backtest_portfolio
+
+values = backtest_portfolio(portfolios["min_variance"], start_value=10_000)
+values.tail()
+```
+
+Parametric Monte Carlo with dynamic rebalancing on simulated paths:
+
+```python
+from helpers.montecarlo import simulate_parametric, rebalance_on_simulation
+
+tickers = list(portfolios["min_variance"].columns)
+sims = simulate_parametric(tickers, n_days=252, n_sims=10, lookback_years=3, seed=42)
+
+# Rebuild weights and backtest on the first simulation using the same logic as historical
+W, V = rebalance_on_simulation(sims[0], lookback_years=4, freq='BMS', which='min_variance', start_value=10_000)
+V.tail()
+```
+
+Bootstrap Monte Carlo with batch rebalanced backtests:
+
+```python
+from helpers.montecarlo import simulate_bootstrap, apply_rebalanced_backtest_to_simulations
+
+sims = simulate_bootstrap(tickers, n_days=252, n_sims=50, lookback_years=3, block_size=10, seed=1)
+results = apply_rebalanced_backtest_to_simulations(sims, lookback_years=4, freq='BMS', which='max_sharpe', start_value=10_000)
+
+# results is a list of (weights_df, values_series)
+len(results), results[0][1].tail()
+```
+
+
 Technical: Multi-Dimensional Scaling (MDS)
 ---------------------------------------
 Purpose
-- MDS is a family of techniques that embed objects described by pairwise dissimilarities (distances) into a low-dimensional Euclidean space so that the pairwise Euclidean distances in the embedding approximate the original dissimilarities.
+- Embed objects described by pairwise dissimilarities into a low-dimensional Euclidean space so that Euclidean distances approximate the original dissimilarities.
 
-Two common variants
-- Classical MDS (metric / Torgerson scaling): computes an exact embedding from a Euclidean distance matrix using linear algebra (double-centering). If the input dissimilarities are true Euclidean distances, classical MDS recovers coordinates (up to rotation/reflection and translation).
-    - Algorithm (brief): given squared distance matrix D^{(2)}, compute B = -0.5 * J D^{(2)} J where J = I - (1/n)11^T. Eigen-decompose B = V Λ V^T and take embedding X = V_k Λ_k^{1/2} using the top k positive eigenvalues.
+Classical MDS (Torgerson)
+- Given the squared distance matrix $D^{(2)}$ with entries $d_{ij}^2$, let $J = I - \frac{1}{n}11^\top$ and
+    $$B = -\tfrac{1}{2} J D^{(2)} J.$$
+- Eigendecompose $B = V\Lambda V^\top$. Keep the top $k$ positive eigenvalues $\Lambda_k$ and corresponding eigenvectors $V_k$. The embedding is
+    $$X = V_k \Lambda_k^{1/2},$$
+    where row $i$ of $X$ gives the $k$-dimensional coordinates for object $i$.
 
-- Metric MDS (stress-minimizing, as implemented in `sklearn.manifold.MDS`): iteratively optimizes a low-dimensional configuration to minimize a stress function (discrepancy between original dissimilarities and embedding distances). It is more flexible (works with non-Euclidean dissimilarities) but is iterative and can be slower.
+Metric MDS (stress-minimizing)
+- Find $X\in\mathbb{R}^{n\times k}$ that minimizes the stress
+    $$\mathrm{Stress}(X) = \sqrt{\sum_{i<j} (d_{ij} - \|x_i - x_j\|)^2},$$
+    solved iteratively (implemented by `sklearn.manifold.MDS` with `dissimilarity='precomputed'`).
 
-Practical notes for this project
-- We convert correlation → distance using either `1 - corr` or `1 - |corr|`. This produces a symmetric dissimilarity matrix with zeros on the diagonal and values in [0,2]. Treating correlation-based distances with MDS gives a geometric view of similarity: nearby points have stronger (absolute) correlations.
-- The implementation uses `sklearn.manifold.MDS` with `dissimilarity='precomputed'`. That performs metric MDS that minimizes stress. By default it initializes randomly; consider `init='classical'` or setting `random_state` for reproducible layouts.
-- Complexity: constructing the full distance matrix is O(n^2) memory/time. MDS itself scales poorly beyond a few hundred points (stress minimization is iterative). For very large universes prefer dimensionality reduction by PCA on features or classical MDS on a landmark subset.
-- Interpretation: MDS coordinates are useful for visualization and exploratory analysis (cluster coherence, outliers) but should not be treated as factor returns or direct inputs to optimization without careful validation.
-
-Tuning and alternatives
-- If plotting many tickers produces clutter, use `annotate=False` in `visualize_clusters` and hover-enabled plotting (e.g., Plotly) to inspect points interactively.
-- Alternatives:
-    - PCA on returns or on the double-centered Gram matrix (fast, linear algebra based).
-    - t-SNE or UMAP for non-linear neighborhood-preserving embeddings (better local clustering but more parameters and interpretation challenges).
+Practical notes
+- Convert correlation $\rho$ to distances via, e.g., $d_{ij}=1-|\rho_{ij}|$ (or $d_{ij}=1-\rho_{ij}$).
+- Classical MDS requires a Euclidean distance matrix; if $B$ has negative eigenvalues, either drop negatives (use only positive spectrum) or use metric MDS.
+- Complexity: forming the full distance matrix costs $O(n^2)$ memory; metric MDS is iterative and can be slow for large $n$ (practical limit depends on CPU and memory).
+- Alternatives: PCA on returns (fast), t-SNE, UMAP (nonlinear, parameter-sensitive).
 
 References
 - Borg, I., & Groenen, P. J. F. (2005). Modern Multidimensional Scaling: Theory and Applications.
@@ -239,3 +289,188 @@ If you want, I can also:
 - add PCA / t-SNE options to `visualize_clusters`,
 - add an option to save the plot to file from the helper, or
 - add an interactive Plotly-based visualization cell to the notebook.
+
+---
+
+# Technical Appendix
+
+---
+
+## 1. Portfolio Construction
+
+### Returns
+
+Let $P_{i,t}$ be the adjusted closing price of asset $i$ on day $t$. Log-returns are:
+
+$$r_{i,t} = \ln\left(\frac{P_{i,t}}{P_{i,t-1}}\right)$$
+
+Over a window of $T$ observations, the sample mean vector and sample covariance matrix are:
+
+$$\hat{\mu} = \frac{1}{T}\sum_{t=1}^{T} r_t \qquad S = \frac{1}{T-1}\sum_{t=1}^{T}(r_t - \hat{\mu})(r_t - \hat{\mu})^\top$$
+
+---
+
+### Covariance Shrinkage (Ledoit–Wolf)
+
+The sample covariance $S$ is noisy when $T$ is not large relative to $n$ (number of assets). Ledoit–Wolf shrinks $S$ toward a structured target $F$:
+
+$$\hat{\Sigma} = (1 - \alpha)\, S + \alpha\, F$$
+
+The target is a scaled identity matrix:
+
+$$F = \frac{\operatorname{tr}(S)}{n}\, I_n$$
+
+The shrinkage intensity $\alpha^* \in [0, 1]$ is chosen analytically to minimise the expected Frobenius loss $\mathbb{E}\|\hat{\Sigma} - \Sigma\|_F^2$. A higher $\alpha$ pulls the matrix toward equal variances and zero correlations; useful when $T/n$ is small.
+
+---
+
+### Min-Variance Portfolio
+
+$$\min_{w}\; w^\top \hat{\Sigma}\, w \quad \text{s.t.} \quad \mathbf{1}^\top w = 1,\quad 0 \le w_i \le w_{\max}$$
+
+The unconstrained closed-form solution is:
+
+$$w^* = \frac{\hat{\Sigma}^{-1}\,\mathbf{1}}{\mathbf{1}^\top \hat{\Sigma}^{-1}\,\mathbf{1}}$$
+
+With box constraints ($w_i \le w_{\max}$) the problem is a convex quadratic program (QP) with no closed form; solved numerically.
+
+---
+
+### Max-Sharpe Portfolio
+
+$$\max_{w}\; \frac{\hat{\mu}^\top w - r_f}{\sqrt{w^\top \hat{\Sigma}\, w}} \quad \text{s.t.} \quad \mathbf{1}^\top w = 1,\quad 0 \le w_i \le w_{\max}$$
+
+Via the homogenisation trick (let $y = w\,/\,(\hat{\mu}^\top w - r_f)$), this is equivalent to the QP:
+
+$$\min_{y}\; y^\top \hat{\Sigma}\, y \quad \text{s.t.} \quad (\hat{\mu} - r_f\,\mathbf{1})^\top y = 1,\quad y \ge 0$$
+
+then recover $w^* = y\,/\,(\mathbf{1}^\top y)$.
+
+---
+
+### Market-Cap Portfolio
+
+$$w_i = \frac{MC_i}{\sum_j MC_j}$$
+
+where $MC_i$ is the free-float market capitalisation of asset $i$. No optimisation step; weights are set directly from market data.
+
+---
+
+## 2. Leverage and Margin
+
+### Definitions
+
+Let $E_t$ denote equity (NAV) at time $t$ and $G_t$ total gross exposure (sum of position values):
+
+$$L_t = \frac{G_t}{E_t}$$
+
+At target leverage $L = 1.7$:
+
+$$G_t = L \cdot E_t \qquad D_t = (L-1)\cdot E_t = 0.7\cdot E_t$$
+
+where $D_t$ is the borrowed amount (margin debt).
+
+---
+
+### Daily NAV Evolution
+
+Let $r_{p,t} = w^\top r_t$ be the portfolio return on day $t$ and $r_m$ the annual margin rate. Position value after market move:
+
+$$G_t = G_{t-1}(1 + r_{p,t})$$
+
+Debt is unchanged intraday. Updated equity:
+
+$$E_t = G_t - D_{t-1} = L\cdot E_{t-1}(1 + r_{p,t}) - (L-1)\cdot E_{t-1}$$
+
+$$\boxed{E_t = E_{t-1}\left(1 + L\, r_{p,t}\right)}$$
+
+Subtracting daily margin interest:
+
+$$E_t = E_{t-1}\left(1 + L\, r_{p,t} - (L-1)\,\frac{r_m}{252}\right)$$
+
+---
+
+### Realized Leverage After a Move
+
+After a portfolio return $r_{p,t}$ without rebalancing:
+
+$$L_t = \frac{G_t}{E_t} = \frac{L(1 + r_{p,t})}{1 + L\, r_{p,t}}$$
+
+The leverage drift is:
+
+$$\Delta L_t = L_t - L = \frac{L\,(1 - L)\,r_{p,t}}{1 + L\, r_{p,t}}$$
+
+Since $L > 1$: a positive return decreases leverage; a negative return increases it. Leverage is asymmetrically dangerous on the downside.
+
+---
+
+## 3. Leverage Safety Interval
+
+Define the rebalance trigger as a fractional band $\delta$ around the target leverage $L$:
+
+$$\text{Rebalance if}\quad L_t \notin \left[L(1 - \delta),\; L(1 + \delta)\right]$$
+
+At $L = 1.7$ and $\delta = 0.10$, the interval is $[1.53,\; 1.87]$.
+
+The critical portfolio return that breaches the upper bound (leverage rises above $L(1+\delta)$) satisfies:
+
+$$\frac{L(1+r)}{1 + L\,r} = L(1+\delta) \implies r^* = \frac{-L\delta}{L(1 + \delta) - 1} \cdot \frac{1}{L}$$
+
+For $L = 1.7$, $\delta = 0.10$: a single-day portfolio return below approximately $-7\%$ will trigger the threshold.
+
+---
+
+### Maintenance Margin
+
+Under IBKR Reg T, the minimum equity ratio for ETFs is 25%:
+
+$$\frac{E_t}{G_t} = \frac{1}{L_t} \ge 0.25 \implies L_t \le 4$$
+
+In practice, the safety interval $[L(1-\delta), L(1+\delta)]$ is set well inside this hard limit. At $L=1.7$ and $\delta=0.10$, the upper bound $1.87$ is far from the margin-call level of $4$.
+
+---
+
+## 4. Performance Metrics
+
+### CAGR
+
+$$\text{CAGR} = \left(\frac{E_T}{E_0}\right)^{252/T} - 1$$
+
+where $T$ is the number of trading days in the backtest.
+
+---
+
+### Annualised Volatility
+
+$$\sigma_p = \sqrt{252}\;\operatorname{std}(r_{p,t})$$
+
+---
+
+### Sharpe Ratio
+
+$$\text{Sharpe} = \frac{\mu_p^{\text{ann}} - r_f}{\sigma_p}$$
+
+where $\mu_p^{\text{ann}} = 252\cdot\mathbb{E}[r_{p,t}]$ is the annualised mean return and $r_f$ is the risk-free rate.
+
+---
+
+### Maximum Drawdown
+
+$$\text{MDD} = \min_t\;\frac{E_t - \max_{s \le t} E_s}{\max_{s \le t} E_s}$$
+
+---
+
+### Sortino Ratio
+
+$$\text{Sortino} = \frac{\mu_p^{\text{ann}} - r_f}{\sigma_d}$$
+
+where the downside deviation is:
+
+$$\sigma_d = \sqrt{252\cdot\mathbb{E}\!\left[\min(r_{p,t} - r_f/252,\;0)^2\right]}$$
+
+---
+
+### Calmar Ratio
+
+$$\text{Calmar} = \frac{\text{CAGR}}{|\text{MDD}|}$$
+

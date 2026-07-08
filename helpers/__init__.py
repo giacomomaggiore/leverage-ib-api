@@ -8,7 +8,7 @@ Public API:
 
 from .fetch import load_data, common_window
 from .stats import log_returns, covariance, covariance_shrunk, sharpe
-from .weights import min_variance, max_sharpe
+from .portfolio import min_variance, max_sharpe
 from .clustering import cluster_select_representatives_from_csv
 
 __all__ = [

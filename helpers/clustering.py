@@ -42,13 +42,13 @@ def cluster_select_representatives_from_csv(
     if universe.shape[1] < 2:
         raise ValueError("Universe CSV must have at least two columns: ticker and AUM.")
 
-    # Standardize the first two columns.
+    # Standardize the first two columns and clean data
     universe = universe.iloc[:, :2].copy()
     universe.columns = ["ticker", "aum_millions"]
     universe["ticker"] = universe["ticker"].astype(str).str.strip().str.upper()
     universe["aum_millions"] = pd.to_numeric(universe["aum_millions"], errors="coerce").fillna(0.0)
 
-    # Build a ticker-to-AUM map.
+    # Build a ticker-to-AUM map, clean data
     aum: Dict[str, float] = dict(zip(universe["ticker"], universe["aum_millions"]))
 
     # Load or update adjusted-close price histories using the shared fetch helper.
@@ -59,6 +59,7 @@ def cluster_select_representatives_from_csv(
 
     for ticker in universe["ticker"]:
         try:
+            # use function in fetch.py to load data from csv locally of YF
             df_prices = load_data(ticker, start_date, end_date)
         except Exception:
             continue
@@ -79,6 +80,8 @@ def cluster_select_representatives_from_csv(
             continue
         if (series.index.max() - series.index.min()).days < min_calendar_days:
             continue
+        
+        # if everything ok: keep the ticker and append it to the kept_tickers list
         kept_tickers.append(ticker)
 
     # Stop early if nothing survives the history filter.
@@ -110,7 +113,10 @@ def cluster_select_representatives_from_csv(
         raise ValueError("distance_metric must be '1-abs_corr' or '1-corr'.")
 
     # Ensure the distance matrix is valid for hierarchical clustering.
+    # sets the diagonal to zero to ensure that self-distance is zero
     np.fill_diagonal(dist_matrix, 0.0)
+    
+    # Convert the square distance matrix to condensed form for linkage function.
     condensed_dist = squareform(dist_matrix, checks=False)
 
     # Run hierarchical clustering.
