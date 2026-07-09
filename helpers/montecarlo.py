@@ -8,6 +8,7 @@ import pandas as pd
 from helpers.fetch import load_data
 from helpers.backtest import backtest_portfolio
 from helpers.portfolio import build_portfolios_from_prices
+from pathlib import Path
 
 
 def _historical_returns(
@@ -16,9 +17,7 @@ def _historical_returns(
 	end: Optional[str] = None,
 	lookback_years: int = 3,
 ) -> pd.DataFrame:
-    
-    # Build historical returns DataFrame for the given tickers and date range.
-    
+	"""Build historical daily simple returns for given tickers and date range."""
 	if end is None:
 		end = pd.Timestamp.today().strftime("%Y-%m-%d")
 	if start is None:
@@ -39,51 +38,40 @@ def _historical_returns(
 
 	prices = pd.concat(series.values(), axis=1, join="inner")
 	prices.columns = list(series.keys())
-	returns = prices.pct_change().dropna(how="any")
-	return returns
+	return prices.pct_change().dropna(how="any")
 
 
 def simulate_parametric(
-	tickers: List[str],
-	n_days: int,
-	n_sims: int = 1000,
-	lookback_years: int = 3,
-	seed: Optional[int] = None,
+    tickers: List[str],
+    n_days: int,
+    n_sims: int = 1000,
+    lookback_years: int = 3,
+    seed: Optional[int] = None,
 ) -> List[pd.DataFrame]:
-	"""
-	Parametric Monte Carlo using multivariate normal daily returns estimated
-	from historical simple returns.
+    """Parametric MC: draw MVN daily returns using μ,Σ from historical returns."""
+    hist = _historical_returns(tickers, lookback_years=lookback_years)
+    if hist.empty:
+        raise ValueError("Not enough historical data to estimate parameters")
 
-	Returns a list of length n_sims; each item is a DataFrame [n_days x tickers].
-	"""
- 
-    # loads historical returns for the given tickers and lookback period
-	hist = _historical_returns(tickers, lookback_years=lookback_years)
-	if hist.empty:
-		raise ValueError("Not enough historical data to estimate parameters")
+    mu = hist.mean().to_numpy()
+    cov = hist.cov().to_numpy()
+    rng = np.random.default_rng(seed)
 
-    # compute mean vector and covariance matrix of historical returns
-	mu = hist.mean().to_numpy()
-	cov = hist.cov().to_numpy()
-	rng = np.random.default_rng(seed)
-
-	sims: List[pd.DataFrame] = []
-	for _ in range(int(n_sims)):
-     
-        # generate multivariate normal draws for n_days using the estimated mean and covariance
-		draws = rng.multivariate_normal(mean=mu, cov=cov, size=int(n_days))
-		df = pd.DataFrame(draws, columns=tickers, index=pd.RangeIndex(n_days))
-		sims.append(df)
-	return sims
+    sims: List[pd.DataFrame] = []
+    for _ in range(int(n_sims)):
+        draws = rng.multivariate_normal(mean=mu, cov=cov, size=int(n_days))
+        df = pd.DataFrame(draws, columns=tickers, index=pd.RangeIndex(n_days))
+        sims.append(df)
+    return sims
 
 
 def simulate_bootstrap(
-	tickers: List[str],
-	n_days: int,
-	n_sims: int = 1000,
-	lookback_years: int = 3,
-	block_size: Optional[int] = None,
-	seed: Optional[int] = None,
+    tickers: List[str],
+    n_days: int,
+    n_sims: int = 1000,
+    lookback_years: int = 3,
+    block_size: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> List[pd.DataFrame]:
 	"""
 	Bootstrap Monte Carlo on historical daily simple returns.
@@ -133,10 +121,10 @@ def simulate_bootstrap(
 
 
 def apply_backtest_to_simulations(
-	weights: pd.DataFrame,
-	simulations: List[pd.DataFrame],
-	start_value: float = 10_000.0,
-	hold: str = "last",
+    weights: pd.DataFrame,
+    simulations: List[pd.DataFrame],
+    start_value: float = 10_000.0,
+    hold: str = "last",
 ) -> List[pd.Series]:
 	"""
 	For each simulated return path, run the backtest and return the value series.
@@ -174,13 +162,13 @@ def apply_backtest_to_simulations(
 
 
 def rebalance_on_simulation(
-	sim_returns: pd.DataFrame,
-	lookback_years: int = 3,
-	freq: str = "BMS",
-	cov_method: str | None = None,
-	cov_params: dict | None = None,
-	which: str = "min_variance",
-	start_value: float = 10_000.0,
+    sim_returns: pd.DataFrame,
+    lookback_years: int = 3,
+    freq: str = "BMS",
+    cov_method: str | None = None,
+    cov_params: dict | None = None,
+    which: str = "min_variance",
+    start_value: float = 10_000.0,
 ) -> tuple[pd.DataFrame, pd.Series]:
 	"""
 	Given one simulated return path [n_days x tickers],
@@ -222,20 +210,19 @@ def rebalance_on_simulation(
 
 
 def apply_rebalanced_backtest_to_simulations(
-	simulations: list[pd.DataFrame],
-	lookback_years: int = 3,
-	freq: str = "BMS",
-	cov_method: str | None = None,
-	cov_params: dict | None = None,
-	which: str = "min_variance",
-	start_value: float = 10_000.0,
+    simulations: list[pd.DataFrame],
+    lookback_years: int = 3,
+    freq: str = "BMS",
+    cov_method: str | None = None,
+    cov_params: dict | None = None,
+    which: str = "min_variance",
+    start_value: float = 10_000.0,
 ) -> list[tuple[pd.DataFrame, pd.Series]]:
 	"""
 	For each simulation, compute dynamic weights (as per historical logic) and return (weights, values).
 	"""
-	results: list[tuple[pd.DataFrame, pd.Series]] = []
-	for sim in simulations:
-		W, V = rebalance_on_simulation(
+	return [
+		rebalance_on_simulation(
 			sim_returns=sim,
 			lookback_years=lookback_years,
 			freq=freq,
@@ -244,6 +231,117 @@ def apply_rebalanced_backtest_to_simulations(
 			which=which,
 			start_value=start_value,
 		)
-		results.append((W, V))
-	return results
+		for sim in simulations
+	]
+
+
+def simulate_and_backtest_portfolios(
+	tickers: List[str],
+	n_days: int,
+	n_sims: int,
+	lookback_years: int = 3,
+	block_size: int = 10,
+	seed: int = 1,
+	method: str = "parametric",
+	start_value: float = 10_000.0,
+) -> pd.DataFrame:
+	"""
+	Simulate returns, rebuild all portfolios on each path, and return value series.
+
+	Output columns are: sim_1_min_variance, sim_1_max_sharpe, ...
+	"""
+	base_tickers = list(dict.fromkeys(tickers))
+	sim_tickers = base_tickers.copy()
+	if "VT" not in sim_tickers:
+		sim_tickers.append("VT")
+
+	# Run Monte Carlo return simulations.
+	if method == "parametric":
+		simulations = simulate_parametric(
+			sim_tickers,
+			n_days=n_days,
+			n_sims=n_sims,
+			lookback_years=lookback_years,
+			seed=seed,
+		)
+	elif method == "bootstrap":
+		simulations = simulate_bootstrap(
+			sim_tickers,
+			n_days=n_days,
+			n_sims=n_sims,
+			lookback_years=lookback_years,
+			block_size=block_size,
+			seed=seed,
+		)
+	else:
+		raise ValueError("method must be 'parametric' or 'bootstrap'")
+
+	strategies = ["min_variance", "max_sharpe", "equal_weight", "market_cap"]
+	all_values: list[pd.Series] = []
+
+	for i, sim in enumerate(simulations, start=1):
+		# Use a business-day index so portfolio rebuilding can use calendar frequencies.
+		idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), periods=sim.shape[0])
+		rets = sim.copy()
+		rets.index = idx
+
+		# Build optimized/equal-weight portfolios only on the selected tickers.
+		prices = (1.0 + rets[base_tickers]).cumprod()
+		weights = build_portfolios_from_prices(
+			prices=prices,
+			start=prices.index.min(),
+			end=prices.index.max(),
+			lookback_years=lookback_years,
+			freq="BMS",
+		)
+
+		# Backtest each strategy on the full simulated returns, including VT for market_cap.
+		for strategy in strategies:
+			values = backtest_portfolio(weights[strategy], start_value=start_value, returns=rets)
+			values.name = (i, strategy)  # MultiIndex column (sim, strategy)
+			all_values.append(values)
+
+	df = pd.concat(all_values, axis=1)
+	df.columns = pd.MultiIndex.from_tuples(df.columns, names=["sim", "strategy"])
+	df.index.name = "date"
+	return df
+
+
+def save_simulations_parquet(values: pd.DataFrame, path: str, engine: str | None = None) -> None:
+	"""
+	Save simulation values DataFrame to Parquet. Ensures MultiIndex columns (sim, strategy).
+	"""
+	df = values.copy()
+	if not isinstance(df.columns, pd.MultiIndex):
+		# Try to parse flat names like 'sim_1_min_variance' → (1, 'min_variance')
+		tuples = []
+		for c in df.columns:
+			sim = None
+			strat = str(c)
+			s = str(c)
+			if s.startswith("sim_"):
+				parts = s.split("_", 2)
+				if len(parts) == 3 and parts[1].isdigit():
+					sim = int(parts[1])
+					strat = parts[2]
+			tuples.append((sim if sim is not None else 0, strat))
+		df.columns = pd.MultiIndex.from_tuples(tuples, names=["sim", "strategy"])
+	# fastparquet requires every MultiIndex level to be str/bytes (sim is currently int)
+	df.columns = pd.MultiIndex.from_tuples(
+		[(str(sim), strat) for sim, strat in df.columns], names=df.columns.names
+	)
+	if df.index.name is None:
+		df.index.name = "date"
+	# Ensure destination folder exists (relative paths preferred in notebooks)
+	p = Path(path)
+	if p.parent and str(p.parent) not in ("", "."):
+		p.parent.mkdir(parents=True, exist_ok=True)
+	try:
+		df.to_parquet(path, compression="snappy", engine=engine)
+	except ImportError as e:
+		raise ImportError(
+			"Parquet export requires 'pyarrow' or 'fastparquet'. Install with:\n"
+			"  pip install pyarrow\n"
+			"or:\n  pip install fastparquet"
+		) from e
 

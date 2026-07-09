@@ -1,3 +1,5 @@
 .venv/
 data/
-.claude.md
+CLAUDE.md
+.github
+.gitignore

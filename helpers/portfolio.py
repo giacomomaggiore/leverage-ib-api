@@ -185,15 +185,15 @@ def _compute_covariance(rets: pd.DataFrame, method: str, params: dict | None) ->
         cs = risk_models.CovarianceShrinkage(rets, returns_data=True)
         cov = cs.ledoit_wolf()
 
-    if method == "empirical":
+    elif method == "empirical":
         cov = risk_models.sample_cov(rets, returns_data=True)
 
-    if method == "oas":
+    elif method == "oas":
         cs = risk_models.CovarianceShrinkage(rets, returns_data=True)
         # Oracle Approximating Shrinkage
         cov = cs.oracle_approximating()
 
-    if method == "ewma":
+    elif method == "ewma":
         alpha = params.get("alpha")
         span = params.get("span")
         if span is None and alpha is not None and alpha > 0:
@@ -202,7 +202,7 @@ def _compute_covariance(rets: pd.DataFrame, method: str, params: dict | None) ->
             span = 60  # ~3 months of daily data by default
         cov = risk_models.exp_cov(rets, span=int(span), returns_data=True)
 
-    if method == "factor":
+    elif method == "factor":
         n_f = int(params.get("n_factors", 3))
         x = rets.values
         # PCA via SVD on demeaned returns
@@ -221,7 +221,10 @@ def _compute_covariance(rets: pd.DataFrame, method: str, params: dict | None) ->
         spec_var = resid.var(axis=0, ddof=1)
         cov = B @ Fcov @ B.T + np.diag(spec_var)
         cov = pd.DataFrame(cov, index=rets.columns, columns=rets.columns)
-    
+
+    else:
+        cov = cov  # no-op to keep structure
+
     if cov is None:
         raise ValueError("cov_method must be one of: 'shrunk', 'empirical', 'oas', 'ewma', 'factor'")
 
@@ -244,53 +247,37 @@ def _compute_covariance(rets: pd.DataFrame, method: str, params: dict | None) ->
 
 
 def build_portfolios(tickers, start, end, lookback_years=4, freq="MS", cov_method=None, cov_params=None):
-    # Use business-month start to avoid holidays
-    # offset start by lookback_years to ensure we have enough data for the first rebalance
-    start = pd.Timestamp(start) + pd.DateOffset(years=lookback_years)
-    rebalance_dates = pd.date_range(start, end, freq="BMS")
+    # Wrapper around build_portfolios_from_prices using a shared price matrix.
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    # Load enough history to cover the first lookback window
+    load_start = start_ts
+    # For rolling windows inside build_portfolios_from_prices, it will access (dt - lookback_years)
+    # Ensure we have sufficient earlier data by extending the load start back by lookback_years
+    load_start = start_ts - pd.DateOffset(years=lookback_years)
 
-    #default params:
-    # Covariance configuration
-    COV_METHOD = "oas"   # 'shrunk' | 'empirical' | 'oas' | 'ewma' | 'factor'
-    COV_PARAMS = {"jitter": 1e-8} 
+    # Assemble aligned adjusted-close prices for the entire period
+    series: dict[str, pd.Series] = {}
+    for t in tickers:
+        s = load_data(t, load_start.strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d"))["adj close"].dropna().rename(t)
+        if s.shape[0] >= 2:
+            series[t] = s
+    if not series:
+        raise ValueError("No price data available to build portfolios")
+    px = pd.concat(series.values(), axis=1, join="inner").sort_index()
 
-    # default cov settings from globals if not provided
-    if cov_method is None:
-        cov_method = COV_METHOD
-    if cov_params is None:
-        cov_params = COV_PARAMS
+    # Rebalance window starts after enough history is accumulated
+    rebalance_start = start_ts + pd.DateOffset(years=lookback_years)
 
-    # Ensure VT is always available as a column for market_cap
-    cols = sorted(set(tickers) | {"VT"})
-    mv, ms, mc, ew = {}, {}, {}, {}
-    for dt in rebalance_dates:
-        as_of = dt.date()
-        w_mv = min_variance(tickers, as_of=as_of, timeframe_years=lookback_years, cov_method=cov_method, cov_params=cov_params)
-        w_ms = max_sharpe(tickers, as_of=as_of, timeframe_years=lookback_years, cov_method=cov_method, cov_params=cov_params)
-        # Reindex to include VT with 0 if not in the optimizer universe
-        mv[dt] = pd.Series(w_mv).reindex(cols, fill_value=0.0)
-        ms[dt] = pd.Series(w_ms).reindex(cols, fill_value=0.0)
-        # Market-cap proxy: 100% VT (explicitly include VT column)
-        mc[dt] = pd.Series({t: (1.0 if t == "VT" else 0.0) for t in cols})
-        # Equal-weight portfolio: 1/N across original input tickers; 0 for VT if not present
-        ew_row = {t: (1.0 / len(tickers)) for t in tickers}
-        for t in set(cols) - set(tickers):
-            ew_row[t] = 0.0
-        ew[dt] = pd.Series(ew_row).reindex(cols, fill_value=0.0)
-
-    def to_daily(d):
-        df = pd.DataFrame(d).T.sort_index()
-        # Start the daily index at the first available weight to avoid leading NaNs
-        first = df.index.min()
-        daily_idx = pd.bdate_range(first, end)
-        return df.reindex(daily_idx, method="ffill")
-
-    return {
-        "min_variance": to_daily(mv),
-        "max_sharpe":   to_daily(ms),
-        "market_cap":   to_daily(mc),
-        "equal_weight": to_daily(ew),
-    }
+    return build_portfolios_from_prices(
+        prices=px,
+        start=rebalance_start,
+        end=end_ts,
+        lookback_years=lookback_years,
+        freq=freq,
+        cov_method=cov_method,
+        cov_params=cov_params,
+    )
 
 
 def build_portfolios_from_prices(
@@ -311,7 +298,7 @@ def build_portfolios_from_prices(
     - freq: rebalancing frequency (e.g., 'BMS' business-month start)
     - cov_method/cov_params: covariance configuration passed to the optimizer
 
-    Returns dict of daily weight DataFrames with keys: 'min_variance', 'max_sharpe', 'market_cap' (equal-weight proxy).
+    Returns dict of daily weight DataFrames with keys: 'min_variance', 'max_sharpe', 'market_cap' (100% VT), 'equal_weight' (1/N).
     """
     if not isinstance(prices, pd.DataFrame) or prices.empty:
         raise ValueError("prices must be a non-empty DataFrame of adjusted-close values")
@@ -387,8 +374,7 @@ def build_portfolios_from_prices(
 
         # Market-cap proxy: force 100% VT (if VT not present, this will be all zeros)
         w_mc = {t: (1.0 if t == "VT" else 0.0) for t in tickers}
-        # Equal-weight portfolio: 1/N
-        w_eq = {t: 1.0 / len(tickers) for t in tickers}
+        # (equal-weight is constructed explicitly below)
 
         # Reindex MV/MS to include VT with 0 if not present in window
         mv[dt] = pd.Series({t: float(w_mv.get(t, 0.0)) for t in tickers}).reindex(cols, fill_value=0.0)

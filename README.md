@@ -7,10 +7,11 @@ Build and backtest a leveraged long-only portfolio of US ETFs, then run it live 
 
 Strategy
 --------
-Three portfolios are compared in backtest and Monte Carlo:
-- Min-variance (Ledoit-Wolf covariance shrinkage)
+Four portfolios are compared in backtest and Monte Carlo:
+- Min-variance (Ledoit–Wolf covariance shrinkage)
 - Max-Sharpe
-- Market-cap weighted
+- Market-cap (100% VT)
+- Equal-weight (1/N)
 
 Target leverage: 1.7x. The best performer is used live.
 
@@ -29,6 +30,16 @@ Pipeline
 5. Monte Carlo: block bootstrap, collect return distribution
 6. Pick best strategy
 7. Live: query IB positions, compute delta to target weights, place orders
+
+Workflow (end-to-end)
+---------------------
+- Universe setup: optionally cluster near-duplicates and select representatives.
+- Build strategies (rebalancing at `freq`, e.g., `BMS`):
+    - `min_variance`, `max_sharpe` via optimizers
+    - `market_cap` = 100% VT (explicit VT column is always included)
+    - `equal_weight` = 1/N baseline
+- Backtest: turn daily weights into a value path with `backtest_portfolio`.
+- Monte Carlo: simulate daily returns (parametric MVN or bootstrap), rebuild weights on simulated prices using the same logic, and backtest per path.
 
 ---
 
@@ -183,7 +194,8 @@ Recent Work (what I changed)
     - Added `backtest_portfolio(weights, start_value=10000.0, returns=None)` to turn any daily weights DataFrame into a portfolio value series. If `returns` is not provided, it loads adjusted-close prices via `load_data` and builds historical daily simple returns.
 
 - `helpers/portfolio.py`
-    - Added `build_portfolios_from_prices(prices, start, end, ...)` to compute dynamic rebalanced weights (min-variance, max-Sharpe, equal-weight proxy) directly from a provided prices matrix. Mirrors the historical pipeline but without fetching.
+    - Added `build_portfolios_from_prices(prices, start, end, ...)` to compute dynamic rebalanced weights (min-variance, max-Sharpe, market-cap=100% VT, equal-weight) directly from a provided prices matrix. Mirrors the historical pipeline but without fetching.
+    - `build_portfolios(...)` now honors the `freq` argument and always includes a `VT` column; adds `equal_weight` (1/N). `market_cap` is set to 100% VT.
 
 - `helpers/montecarlo.py`
     - `simulate_parametric(...)`: multivariate-normal daily return paths estimated from historical mean/cov.
