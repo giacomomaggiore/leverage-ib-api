@@ -223,7 +223,7 @@ Row $i$ of $X$ is the $k$-dimensional coordinate of ticker $i$. Double-centering
 
 **Metric MDS** (what `sklearn.manifold.MDS` uses here) instead solves an optimization problem directly, minimizing the stress between target and embedded distances:
 
-$$\text{Stress}(X) = \sqrt{\sum_{i<j}\big(d_{ij} - \lVert x_i - x_j\rVert\big)^2}$$
+$$\text{Stress}(X) = \sqrt{\sum_{i \lt j}\big(d_{ij} - \lVert x_i - x_j\rVert\big)^2}$$
 
 This is more robust when the distance matrix isn't perfectly Euclidean (e.g. $1-|\rho_{ij}|$ distances don't always satisfy the triangle inequality exactly), which is the case here since correlation distance is only an approximate metric.
 
