@@ -43,7 +43,18 @@ Turns price history into portfolio weights.
 - `build_portfolios_from_prices(prices, start, end, lookback_years, freq, ...)` — the core rebalancing loop. At every rebalance date it takes a rolling lookback window, recomputes min-variance and max-Sharpe weights, sets `market_cap` to 100% VT, and sets `equal_weight` to 1/N, then forward-fills each schedule into a daily weights DataFrame. This is reused for both the historical backtest and the Monte Carlo rebalancing (same logic run on simulated prices).
 
 ### `helpers/backtest.py`
-- `backtest_portfolio(weights, start_value, returns)` — converts a daily weights DataFrame into a portfolio value series by forward-filling weights onto return dates and compounding the weighted daily returns. If `returns` isn't supplied, it loads historical prices for the weight columns and derives returns itself.
+- `portfolio_returns(weights, returns)` — forward-fills a daily weights DataFrame onto return dates and computes the weighted daily return series. If `returns` isn't supplied, it loads historical prices for the weight columns and derives returns itself. Shared by `backtest_portfolio` and `leverage_backtest`.
+- `backtest_portfolio(weights, start_value, returns)` — compounds `portfolio_returns` into a portfolio value series (unlevered, no margin loan).
+
+### `helpers/leverage.py`
+Simulates a margin-loan-financed leveraged portfolio, modeled on IBKR's Reg T margin mechanics.
+- `load_margin_rate(index, spread)` — daily annualized margin borrow rate for each date in `index`: FRED EFFR (`data/FRED_EFFR.csv`) plus a `spread` approximating IBKR's real tiered markup over the benchmark rate (EFFR alone understates actual borrowing cost).
+- `leverage_backtest(weights, leverage, start_value, returns, freq, band, hard_cap, spread)` — the core simulation. Each day: gross exposure moves with the weighted return of the underlying assets (`portfolio_returns`), margin debt compounds interest at `load_margin_rate` under an actual/360 day-count (IBKR's convention), and equity is the residual (`gross_exposure - debt`). Gross exposure is reset to `leverage × equity` (a rebalance) when:
+  - `freq` is set to `'daily'`, `'weekly'`, or `'monthly'` — on the first trading day of each new period; or
+  - `freq=None` — as soon as realized leverage drifts outside `[leverage×(1-band), leverage×(1+band)]` (default band ±10%, matching the target/band described below).
+  - Independently of either mode, a `hard_cap` breach (default 4.0, IBKR's approximate Reg T ceiling) forces an immediate rebalance, modeling a margin call.
+  - Raises if equity is wiped out (`equity <= 0`) rather than silently returning nonsense leverage.
+  - Returns a DataFrame indexed by date with columns `portfolio_value, gross_exposure, debt, leverage, margin_rate, rebalanced`.
 
 ### `helpers/montecarlo.py`
 Stress-tests the strategies against simulated futures instead of the one realized history.
@@ -66,6 +77,7 @@ The runnable, end-to-end walkthrough: cluster the universe → build all four po
 ### `data/`
 - `etf_universe.csv` — the candidate ETF universe with AUM (in millions USD), used by the clustering step to break ties.
 - `{ticker}.csv` — one file per ticker with `date` and `adj close` columns, incrementally maintained by `load_data`.
+- `FRED_EFFR.csv` — daily Effective Federal Funds Rate (percent) from FRED, used by `helpers/leverage.py` as the margin-loan benchmark rate.
 
 ### `output/`
 Generated artifacts (Parquet exports of Monte Carlo runs); not checked in as source data.
@@ -92,6 +104,12 @@ Leverage Mechanics
 -------------------
 At target leverage `L`, gross exposure is `L × equity` and the rest is margin debt. A market move changes exposure before debt is repaid, so leverage drifts every day: a gain *reduces* leverage, a loss *increases* it (leverage compounds losses faster than gains). The ±10% rebalance band exists to catch that drift before it compounds — at `L=1.7`, a single-day portfolio loss of roughly 7% would already breach the band. IBKR's Reg T maintenance margin caps usable leverage around 4x for ETFs, so the 1.7x target with a 1.87x upper band leaves a wide safety margin before a margin call.
 
+This is implemented in `helpers/leverage.py` (`leverage_backtest`), which simulates the margin loan day by day rather than just applying a constant multiplier to returns:
+
+- **Financing cost**: margin debt accrues daily interest at FRED EFFR plus a `spread` (default 1%, approximating IBKR's tiered markup over the benchmark rate), compounded under an actual/360 day-count — IBKR's own convention. This cost is what actually erodes equity between rebalances; a flat "leverage × return" backtest would miss it entirely.
+- **Rebalance triggers**: either a fixed calendar schedule (`freq='daily'|'weekly'|'monthly'`) or, if no frequency is given, the ±10% drift band described above. A separate `hard_cap` (default 4.0) forces an emergency rebalance if leverage ever breaches it, independent of the normal schedule/band — a proxy for a margin call.
+- Daily rebalancing pins leverage tightly to target (drift is bounded by one day's move); monthly rebalancing can let leverage drift substantially during sustained drawdowns (e.g. leverage rose to ~2.3x on a 1.7x target for VT during the 2022 selloff, under monthly rebalancing) before the next scheduled reset catches it — illustrating why the band exists as a faster backstop than a fixed calendar.
+
 ---
 
 Setup
@@ -115,6 +133,19 @@ from helpers.montecarlo import simulate_bootstrap, rebalance_on_simulation
 
 sims = simulate_bootstrap(["VTI", "IEF", "GLD", "VT"], n_days=252, n_sims=50, block_size=10, seed=1)
 weights, values = rebalance_on_simulation(sims[0], which="min_variance")
+```
+
+```python
+from helpers.portfolio import build_portfolios
+from helpers.leverage import leverage_backtest
+
+portfolios = build_portfolios(["VTI", "IEF", "GLD", "VT"], "2015-01-01", "2024-01-01")
+
+# Band-based rebalancing (default): resets to 1.7x whenever leverage drifts past +/-10%
+margin = leverage_backtest(portfolios["min_variance"], leverage=1.7, start_value=10_000)
+
+# Calendar-based rebalancing instead of the drift band
+margin_monthly = leverage_backtest(portfolios["min_variance"], leverage=1.7, freq="monthly")
 ```
 
 ---

@@ -8,23 +8,21 @@ import pandas as pd
 from helpers.fetch import load_data
 
 
-def backtest_portfolio(
+def portfolio_returns(
 	weights: pd.DataFrame,
-	start_value: float = 10_000.0,
 	returns: Optional[pd.DataFrame] = None,
 ) -> pd.Series:
 	"""
-	Compute the day-by-day portfolio value time series given a weights DataFrame.
+	Compute the day-by-day weighted return of an (unlevered) portfolio.
 
 	Inputs
 	- weights: DataFrame [dates x tickers], daily portfolio weights (sum ~ 1 per row).
 			   If weights change over time, rebalancing is assumed at the start of each day.
-	- start_value: initial portfolio value.
 	- returns: optional DataFrame [dates x tickers] of daily simple returns for the same tickers.
 			   If None, historical returns are built from adjusted-close prices via `load_data`.
 
 	Output
-	- Series of portfolio values indexed by business days (intersection of weights/returns dates).
+	- Series of daily weighted returns indexed by business days (intersection of weights/returns dates).
 	"""
 	if not isinstance(weights, pd.DataFrame) or weights.empty:
 		raise ValueError("'weights' must be a non-empty DataFrame")
@@ -81,8 +79,21 @@ def backtest_portfolio(
 
 	# Daily portfolio returns: weighted sum of constituent returns
 	port_rets = (w_norm * rets).sum(axis=1)
+	port_rets.name = "portfolio_return"
+	return port_rets
 
-	# Value path
+
+def backtest_portfolio(
+	weights: pd.DataFrame,
+	start_value: float = 10_000.0,
+	returns: Optional[pd.DataFrame] = None,
+) -> pd.Series:
+	"""
+	Compute the day-by-day portfolio value time series given a weights DataFrame.
+
+	See `portfolio_returns` for the meaning of `weights`/`returns`.
+	"""
+	port_rets = portfolio_returns(weights, returns)
 	values = start_value * (1.0 + port_rets).cumprod()
 	values.name = "portfolio_value"
 	return values
