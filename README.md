@@ -64,7 +64,8 @@ Stress-tests the strategies against simulated futures instead of the one realize
 - `rebalance_on_simulation(sim_returns, lookback_years, freq, which, ...)` — compounds one simulated return path into synthetic prices, then reruns the *same* dynamic rebalancing logic used historically (`build_portfolios_from_prices`) on that path. This is the realistic version: it tests whether the optimizer keeps working when the future doesn't look like the past.
 - `apply_rebalanced_backtest_to_simulations(simulations, ...)` — batch version of the function above, one `(weights, values)` pair per simulation.
 - `simulate_and_backtest_portfolios(tickers, n_days, n_sims, method, ...)` — simulates paths (parametric or bootstrap), rebuilds all four strategies on each path, and returns one combined DataFrame with a `(sim, strategy)` column MultiIndex.
-- `save_simulations_parquet(values, path, engine)` — persists that MultiIndex DataFrame to Parquet under `output/`.
+- `leverage_backtest_on_simulation(sim_returns, ..., which, leverage, ...)` — builds dynamic weights on a single simulated path and runs the leveraged backtest (uses the simulated EFFR path if present). Useful when you want both the weight schedule and the full leverage state for diagnostics.
+- `save_simulations_parquet(values, path, engine)` — persists that MultiIndex DataFrame to Parquet under `output/`. Note: for Parquet compatibility the `sim` level is written as strings; when reading back, cast to integers if you want to index with numbers (see examples below).
 
 ### `helpers/clustering.py`
 Shrinks the ETF universe before optimization, so the optimizer isn't fed near-duplicate assets (e.g. an aggregate bond ETF alongside its own sleeve constituents), which would make the covariance matrix ill-conditioned.
@@ -72,7 +73,9 @@ Shrinks the ETF universe before optimization, so the optimizer isn't fed near-du
 - `visualize_clusters(clusters, returns, ...)` — projects the correlation-distance matrix into 2D with MDS (multi-dimensional scaling) and scatter-plots tickers colored by cluster, so you can visually sanity-check which ETFs got grouped together.
 
 ### `main.ipynb`
-The runnable, end-to-end walkthrough: cluster the universe → build all four portfolios over the historical window → backtest and compare them → run parametric and bootstrap Monte Carlo → export simulation results to `output/mc_values.parquet`.
+The runnable, end-to-end walkthrough: cluster the universe → build all four portfolios over the historical window → backtest and compare them → run parametric and bootstrap Monte Carlo → export unlevered simulation results to `output/mc_values.parquet` and leveraged Monte Carlo results to `output/mc_leverage_values.parquet`.
+
+There is a dedicated cell that, for each simulated path: (1) rebuilds all four strategies on synthetic prices, (2) applies `leverage_backtest` with configurable leverage and rebalance frequency, and (3) saves the portfolio value paths (by simulation and strategy) to Parquet.
 
 ### `data/`
 - `etf_universe.csv` — the candidate ETF universe with AUM (in millions USD), used by the clustering step to break ties.
@@ -110,6 +113,8 @@ This is implemented in `helpers/leverage.py` (`leverage_backtest`), which simula
 - **Rebalance triggers**: either a fixed calendar schedule (`freq='daily'|'weekly'|'monthly'`) or, if no frequency is given, the ±10% drift band described above. A separate `hard_cap` (default 4.0) forces an emergency rebalance if leverage ever breaches it, independent of the normal schedule/band — a proxy for a margin call.
 - Daily rebalancing pins leverage tightly to target (drift is bounded by one day's move); monthly rebalancing can let leverage drift substantially during sustained drawdowns (e.g. leverage rose to ~2.3x on a 1.7x target for VT during the 2022 selloff, under monthly rebalancing) before the next scheduled reset catches it — illustrating why the band exists as a faster backstop than a fixed calendar.
 
+In Monte Carlo backtests, the simulated EFFR path (if present in the simulation as an `EFFR` column) is passed into `leverage_backtest` so financing costs evolve consistently with the simulated rate environment.
+
 ---
 
 Setup
@@ -146,6 +151,73 @@ margin = leverage_backtest(portfolios["min_variance"], leverage=1.7, start_value
 
 # Calendar-based rebalancing instead of the drift band
 margin_monthly = leverage_backtest(portfolios["min_variance"], leverage=1.7, freq="monthly")
+```
+
+Leveraged Monte Carlo backtests (all four strategies) and Parquet export:
+```python
+from pathlib import Path
+import pandas as pd
+from helpers.montecarlo import simulate_bootstrap, simulate_parametric, save_simulations_parquet
+from helpers.portfolio import build_portfolios_from_prices
+from helpers.leverage import leverage_backtest
+
+# Configuration
+selected_tickers = ["VTI", "IEF", "GLD"]
+n_days, n_sims, lookback_years = 252*5, 5, 3
+method = "bootstrap"  # or "parametric"
+leverage = 2.0
+lev_rebalance_freq = "monthly"  # "daily" | "weekly" | "monthly"; use None to enable drift-band rebalancing
+out_path = Path("output/mc_leverage_values.parquet")
+
+# Ensure VT exists for the market-cap benchmark
+sim_tickers = list(dict.fromkeys(selected_tickers))
+if "VT" not in sim_tickers:
+  sim_tickers.append("VT")
+
+# 1) Simulate return paths (includes an EFFR column when available)
+if method == "bootstrap":
+  simulations = simulate_bootstrap(sim_tickers, n_days=n_days, n_sims=n_sims, lookback_years=lookback_years, block_size=10, seed=1)
+else:
+  simulations = simulate_parametric(sim_tickers, n_days=n_days, n_sims=n_sims, lookback_years=lookback_years, seed=1)
+
+# 2) Rebuild strategies on synthetic prices and run leveraged backtests
+strategies = ["min_variance", "max_sharpe", "market_cap", "equal_weight"]
+all_values = []
+for i, sim in enumerate(simulations, start=1):
+  idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), periods=sim.shape[0])
+  effr = sim.get("EFFR")
+  if effr is not None:
+    effr.index = idx
+  rets = sim.drop(columns=["EFFR"], errors="ignore").set_index(idx)
+  prices = (1.0 + rets[sim_tickers]).cumprod()
+  weights = build_portfolios_from_prices(prices, start=prices.index.min(), end=prices.index.max(), lookback_years=lookback_years, freq="BMS")
+  for strategy in strategies:
+    lev_df = leverage_backtest(weights[strategy], leverage=leverage, start_value=10_000.0, returns=rets, effr=effr, freq=lev_rebalance_freq)
+    all_values.append(lev_df["portfolio_value"].rename((i, strategy)))
+
+values_df = pd.concat(all_values, axis=1)
+values_df.columns = pd.MultiIndex.from_tuples(values_df.columns, names=["sim", "strategy"])
+values_df.index.name = "date"
+save_simulations_parquet(values_df, str(out_path), engine="pyarrow")
+```
+
+Reading and slicing the saved Parquet (note the `sim` level stored as strings):
+```python
+import pandas as pd
+from helpers.stats import quantiles_df
+
+df = pd.read_parquet("output/mc_leverage_values.parquet", engine="pyarrow")
+
+# Cast the first (sim) level to int for numeric indexing like df[(1, "min_variance")]
+if isinstance(df.columns, pd.MultiIndex):
+  try:
+    df.columns = pd.MultiIndex.from_tuples([(int(sim), strat) for sim, strat in df.columns], names=df.columns.names)
+  except Exception:
+    pass
+
+series_one = df[(1, "min_variance")]
+by_strategy = df.xs("min_variance", level="strategy", axis=1)
+print(quantiles_df(by_strategy))
 ```
 
 ---
