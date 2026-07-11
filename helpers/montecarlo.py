@@ -11,6 +11,9 @@ from helpers.portfolio import build_portfolios_from_prices
 from pathlib import Path
 
 
+DATA_DIR = Path(__file__).parent.parent / "data"
+
+
 def _historical_returns(
 	tickers: List[str],
 	start: Optional[str] = None,
@@ -41,6 +44,35 @@ def _historical_returns(
 	return prices.pct_change().dropna(how="any")
 
 
+def _historical_effr() -> pd.Series:
+	"""Historical EFFR series in percentage points."""
+	effr = pd.read_csv(DATA_DIR / "FRED_EFFR.csv", parse_dates=["date"], index_col="date")["EFFR"]
+	return effr.sort_index().astype(float)
+
+
+def _simulate_effr_path(n_days: int, method: str, rng: np.random.Generator) -> pd.Series:
+	"""Simulate an EFFR scenario path in percentage points."""
+	effr = _historical_effr()
+	if effr.empty:
+		raise ValueError("Not enough historical EFFR data to simulate a rate path")
+
+	changes = effr.diff().dropna()
+	if changes.empty:
+		raise ValueError("Not enough historical EFFR changes to simulate a rate path")
+
+	last_level = float(effr.iloc[-1])
+	if method == "bootstrap":
+		draws = rng.choice(changes.to_numpy(), size=int(n_days), replace=True)
+	else:
+		mu = float(changes.mean())
+		sigma = float(changes.std(ddof=1))
+		draws = rng.normal(loc=mu, scale=sigma, size=int(n_days)) if sigma > 0 else np.full(int(n_days), mu)
+
+	path = last_level + np.cumsum(draws)
+	path = np.clip(path, a_min=0.0, a_max=None)
+	return pd.Series(path, name="EFFR")
+
+
 def simulate_parametric(
     tickers: List[str],
     n_days: int,
@@ -61,6 +93,7 @@ def simulate_parametric(
     for _ in range(int(n_sims)):
         draws = rng.multivariate_normal(mean=mu, cov=cov, size=int(n_days))
         df = pd.DataFrame(draws, columns=tickers, index=pd.RangeIndex(n_days))
+        df["EFFR"] = _simulate_effr_path(n_days, method="parametric", rng=rng).to_numpy()
         sims.append(df)
     return sims
 
@@ -84,17 +117,21 @@ def simulate_bootstrap(
 	if hist.empty:
 		raise ValueError("Not enough historical data to bootstrap")
 
+	effr = _historical_effr().reindex(hist.index, method="ffill")
+	joint = hist.copy()
+	joint["EFFR"] = effr
+
 	rng = np.random.default_rng(seed)
 
 	# number of historical observations available for bootstrapping
-	T = hist.shape[0]
+	T = joint.shape[0]
 
 	sims: List[pd.DataFrame] = []
 	if not block_size or block_size <= 1:
 		# IID bootstrap: sample rows with replacement
 		for _ in range(int(n_sims)):
 			idx = rng.integers(low=0, high=T, size=int(n_days))
-			df = hist.iloc[idx].reset_index(drop=True)
+			df = joint.iloc[idx].reset_index(drop=True)
 			df.index = pd.RangeIndex(n_days)
 			sims.append(df)
 	else:
@@ -107,11 +144,11 @@ def simulate_bootstrap(
 				# number of valid start positions so a full block fits is (T - b + 1)
 				if T - b + 1 > 0:
 					start = int(rng.integers(low=0, high=T - b + 1))
-					block = hist.iloc[start : start + b]
+					block = joint.iloc[start : start + b]
 				else:
 					# history shorter than block: take whole history as a block
 					start = 0
-					block = hist.copy()
+					block = joint.copy()
 				chunks.append(block)
 				days_left -= block.shape[0]
 			df = pd.concat(chunks, axis=0).iloc[:n_days].reset_index(drop=True)
@@ -137,7 +174,7 @@ def apply_backtest_to_simulations(
 	if not isinstance(weights, pd.DataFrame) or weights.empty:
 		raise ValueError("'weights' must be a non-empty DataFrame")
 
-	tickers = list(simulations[0].columns) if simulations else list(weights.columns)
+	tickers = [c for c in (list(simulations[0].columns) if simulations else list(weights.columns)) if c != "EFFR"]
 	if not tickers:
 		raise ValueError("No tickers available for simulations")
 
@@ -155,8 +192,8 @@ def apply_backtest_to_simulations(
 	results: List[pd.Series] = []
 	for sim in simulations:
 		# Build a constant-weights DataFrame over the simulation horizon
-		W = pd.DataFrame(np.tile(base_w.to_numpy(), (sim.shape[0], 1)), index=sim.index, columns=sim.columns)
-		values = backtest_portfolio(W, start_value=start_value, returns=sim)
+		W = pd.DataFrame(np.tile(base_w.to_numpy(), (sim.shape[0], 1)), index=sim.index, columns=tickers)
+		values = backtest_portfolio(W, start_value=start_value, returns=sim[tickers])
 		results.append(values)
 	return results
 
@@ -184,7 +221,10 @@ def rebalance_on_simulation(
 	# Synthesize business-day index for stability
 	n_days = sim_returns.shape[0]
 	idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), periods=n_days)
-	rets = sim_returns.copy()
+	effr = sim_returns["EFFR"].copy() if "EFFR" in sim_returns.columns else None
+	if effr is not None:
+		effr.index = idx
+	rets = sim_returns.drop(columns=["EFFR"], errors="ignore").copy()
 	rets.index = idx
 
 	# Synthetic prices starting at 1.0
@@ -206,6 +246,60 @@ def rebalance_on_simulation(
 	W = weights_dict[which]
 
 	values = backtest_portfolio(W, start_value=start_value, returns=rets)
+	return W, values
+
+
+def leverage_backtest_on_simulation(
+    sim_returns: pd.DataFrame,
+    lookback_years: int = 3,
+    freq: str = "BMS",
+    cov_method: str | None = None,
+    cov_params: dict | None = None,
+    which: str = "min_variance",
+    leverage: float = 2.0,
+    start_value: float = 10_000.0,
+    band: float = 0.05,
+    hard_cap: float = 4.0,
+    spread: float = 0.01,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+	"""Build dynamic weights on one simulation path and run the leveraged backtest."""
+	if not isinstance(sim_returns, pd.DataFrame) or sim_returns.empty:
+		raise ValueError("sim_returns must be a non-empty DataFrame")
+
+	n_days = sim_returns.shape[0]
+	idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), periods=n_days)
+	effr = sim_returns["EFFR"] if "EFFR" in sim_returns.columns else None
+	rets = sim_returns.drop(columns=["EFFR"], errors="ignore").copy()
+	rets.index = idx
+
+	prices = (1.0 + rets).cumprod()
+	weights_dict = build_portfolios_from_prices(
+		prices=prices,
+		start=prices.index.min(),
+		end=prices.index.max(),
+		lookback_years=lookback_years,
+		freq=freq,
+		cov_method=cov_method,
+		cov_params=cov_params,
+	)
+
+	if which not in weights_dict:
+		raise ValueError(f"which must be one of {list(weights_dict.keys())}")
+	W = weights_dict[which]
+
+	from helpers.leverage import leverage_backtest
+
+	values = leverage_backtest(
+		W,
+		leverage=leverage,
+		start_value=start_value,
+		returns=rets,
+		effr=effr,
+		freq=None,
+		band=band,
+		hard_cap=hard_cap,
+		spread=spread,
+	)
 	return W, values
 
 

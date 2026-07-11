@@ -25,3 +25,36 @@ def covariance_shrunk(returns: pd.DataFrame) -> pd.DataFrame:
 
     lw = LedoitWolf().fit(returns)
     return pd.DataFrame(lw.covariance_, index=returns.columns, columns=returns.columns)
+
+
+
+def quantiles_df(
+    df: pd.DataFrame,
+    quantiles: list[float] = [0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99],
+) -> pd.Series:
+    """
+    Compute quantiles of the terminal portfolio value across simulation columns.
+
+    Expected input format:
+    - index: date
+    - columns: simulation paths
+    - values: portfolio value at each date for each simulation
+
+    Returns a Series keyed by quantile labels plus mean/min/max/std for the final row.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("df must be a non-empty DataFrame")
+
+    terminal = pd.to_numeric(df.iloc[-1], errors="coerce").dropna()
+    if terminal.empty:
+        raise ValueError("df must contain numeric terminal simulation values")
+
+    result = pd.Series(dtype=float)
+    for q in quantiles:
+        result[f"q{int(q * 100):02d}"] = float(terminal.quantile(q))
+
+    result["mean"] = float(terminal.mean())
+    result["min"] = float(terminal.min())
+    result["max"] = float(terminal.max())
+    result["std"] = float(terminal.std())
+    return result
