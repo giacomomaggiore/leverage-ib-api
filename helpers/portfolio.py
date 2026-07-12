@@ -372,8 +372,8 @@ def build_portfolios_from_prices(
         except Exception:
             w_ms = {t: 0.0 for t in tickers}
 
-        # Market-cap proxy: force 100% VT (if VT not present, this will be all zeros)
-        w_mc = {t: (1.0 if t == "VT" else 0.0) for t in tickers}
+        # Market-cap proxy: force 100% VT, including when VT is not an optimization ticker.
+        w_mc = {t: (1.0 if t == "VT" else 0.0) for t in cols}
         # (equal-weight is constructed explicitly below)
 
         # Reindex MV/MS to include VT with 0 if not present in window

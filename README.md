@@ -73,9 +73,9 @@ Shrinks the ETF universe before optimization, so the optimizer isn't fed near-du
 - `visualize_clusters(clusters, returns, ...)` — projects the correlation-distance matrix into 2D with MDS (multi-dimensional scaling) and scatter-plots tickers colored by cluster, so you can visually sanity-check which ETFs got grouped together.
 
 ### `main.ipynb`
-The runnable, end-to-end walkthrough: cluster the universe → build all four portfolios over the historical window → backtest and compare them → run parametric and bootstrap Monte Carlo → export unlevered simulation results to `output/mc_values.parquet` and leveraged Monte Carlo results to `output/mc_leverage_values.parquet`.
+The runnable, end-to-end walkthrough: cluster the universe → build all four portfolios over the historical window → backtest and compare them → run bootstrap Monte Carlo → export unlevered simulation results to `output/mc_values.parquet` and leveraged Monte Carlo results by rebalance mode.
 
-There is a dedicated cell that, for each simulated path: (1) rebuilds all four strategies on synthetic prices, (2) applies `leverage_backtest` with configurable leverage and rebalance frequency, and (3) saves the portfolio value paths (by simulation and strategy) to Parquet.
+There are dedicated cells for both unlevered and leveraged exports. The leveraged cell simulates paths once, reuses those same paths across `daily`, `weekly`, `monthly`, and band-based rebalancing, and saves one Parquet file per mode so the results are directly comparable.
 
 ### `data/`
 - `etf_universe.csv` — the candidate ETF universe with AUM (in millions USD), used by the clustering step to break ties.
@@ -84,6 +84,8 @@ There is a dedicated cell that, for each simulated path: (1) rebuilds all four s
 
 ### `output/`
 Generated artifacts (Parquet exports of Monte Carlo runs); not checked in as source data.
+- `mc_values.parquet` — unlevered Monte Carlo values for all four strategies.
+- `mc_leverage_values_daily.parquet`, `mc_leverage_values_weekly.parquet`, `mc_leverage_values_monthly.parquet`, `mc_leverage_values_band.parquet` — leveraged Monte Carlo values for each leverage rebalancing mode.
 
 ---
 
@@ -153,52 +155,92 @@ margin = leverage_backtest(portfolios["min_variance"], leverage=1.7, start_value
 margin_monthly = leverage_backtest(portfolios["min_variance"], leverage=1.7, freq="monthly")
 ```
 
-Leveraged Monte Carlo backtests (all four strategies) and Parquet export:
+Unlevered Monte Carlo backtests (all four strategies) and Parquet export:
+```python
+from pathlib import Path
+from helpers.montecarlo import simulate_and_backtest_portfolios, save_simulations_parquet
+
+selected_tickers = ["VTI", "IEF", "GLD"]
+
+values = simulate_and_backtest_portfolios(
+    tickers=selected_tickers,
+    n_days=252 * 5,
+    n_sims=50,
+    lookback_years=3,
+    block_size=10,
+    seed=1,
+    method="bootstrap",
+    start_value=10_000.0,
+)
+
+save_simulations_parquet(values, "output/mc_values.parquet", engine="pyarrow")
+```
+
+Leveraged Monte Carlo backtests (all four strategies) and per-frequency Parquet exports:
 ```python
 from pathlib import Path
 import pandas as pd
-from helpers.montecarlo import simulate_bootstrap, simulate_parametric, save_simulations_parquet
+from helpers.montecarlo import simulate_bootstrap, save_simulations_parquet
 from helpers.portfolio import build_portfolios_from_prices
 from helpers.leverage import leverage_backtest
 
 # Configuration
 selected_tickers = ["VTI", "IEF", "GLD"]
 n_days, n_sims, lookback_years = 252*5, 5, 3
-method = "bootstrap"  # or "parametric"
 leverage = 2.0
-lev_rebalance_freq = "monthly"  # "daily" | "weekly" | "monthly"; use None to enable drift-band rebalancing
-out_path = Path("output/mc_leverage_values.parquet")
+lev_rebalance_freq_list = ["daily", "weekly", "monthly", None]
+band, hard_cap, spread = 0.05, 4.0, 0.01
 
 # Ensure VT exists for the market-cap benchmark
-sim_tickers = list(dict.fromkeys(selected_tickers))
+base_tickers = list(dict.fromkeys(selected_tickers))
+sim_tickers = base_tickers.copy()
 if "VT" not in sim_tickers:
   sim_tickers.append("VT")
 
 # 1) Simulate return paths (includes an EFFR column when available)
-if method == "bootstrap":
-  simulations = simulate_bootstrap(sim_tickers, n_days=n_days, n_sims=n_sims, lookback_years=lookback_years, block_size=10, seed=1)
-else:
-  simulations = simulate_parametric(sim_tickers, n_days=n_days, n_sims=n_sims, lookback_years=lookback_years, seed=1)
+simulations = simulate_bootstrap(
+  sim_tickers,
+  n_days=n_days,
+  n_sims=n_sims,
+  lookback_years=lookback_years,
+  block_size=10,
+  seed=1,
+)
 
 # 2) Rebuild strategies on synthetic prices and run leveraged backtests
 strategies = ["min_variance", "max_sharpe", "market_cap", "equal_weight"]
-all_values = []
-for i, sim in enumerate(simulations, start=1):
-  idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), periods=sim.shape[0])
-  effr = sim.get("EFFR")
-  if effr is not None:
-    effr.index = idx
-  rets = sim.drop(columns=["EFFR"], errors="ignore").set_index(idx)
-  prices = (1.0 + rets[sim_tickers]).cumprod()
-  weights = build_portfolios_from_prices(prices, start=prices.index.min(), end=prices.index.max(), lookback_years=lookback_years, freq="BMS")
-  for strategy in strategies:
-    lev_df = leverage_backtest(weights[strategy], leverage=leverage, start_value=10_000.0, returns=rets, effr=effr, freq=lev_rebalance_freq)
-    all_values.append(lev_df["portfolio_value"].rename((i, strategy)))
+for lev_rebalance_freq in lev_rebalance_freq_list:
+  all_values = []
+  for i, sim in enumerate(simulations, start=1):
+    idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), periods=sim.shape[0])
+    effr = sim["EFFR"].copy() if "EFFR" in sim.columns else None
+    if effr is not None:
+      effr.index = idx
+    rets = sim.drop(columns=["EFFR"], errors="ignore").copy()
+    rets.index = idx
 
-values_df = pd.concat(all_values, axis=1)
-values_df.columns = pd.MultiIndex.from_tuples(values_df.columns, names=["sim", "strategy"])
-values_df.index.name = "date"
-save_simulations_parquet(values_df, str(out_path), engine="pyarrow")
+    # Optimized/equal-weight portfolios use selected tickers; VT remains available for market_cap returns.
+    prices = (1.0 + rets[base_tickers]).cumprod()
+    weights = build_portfolios_from_prices(prices, start=prices.index.min(), end=prices.index.max(), lookback_years=lookback_years, freq="BMS")
+    for strategy in strategies:
+      lev_df = leverage_backtest(
+        weights[strategy],
+        leverage=leverage,
+        start_value=10_000.0,
+        returns=rets,
+        effr=effr,
+        freq=lev_rebalance_freq,
+        band=band,
+        hard_cap=hard_cap,
+        spread=spread,
+      )
+      all_values.append(lev_df["portfolio_value"].rename((i, strategy)))
+
+  values_df = pd.concat(all_values, axis=1)
+  values_df.columns = pd.MultiIndex.from_tuples(values_df.columns, names=["sim", "strategy"])
+  values_df.index.name = "date"
+  tag = lev_rebalance_freq if lev_rebalance_freq else "band"
+  save_simulations_parquet(values_df, f"output/mc_leverage_values_{tag}.parquet", engine="pyarrow")
 ```
 
 Reading and slicing the saved Parquet (note the `sim` level stored as strings):
@@ -206,7 +248,7 @@ Reading and slicing the saved Parquet (note the `sim` level stored as strings):
 import pandas as pd
 from helpers.stats import quantiles_df
 
-df = pd.read_parquet("output/mc_leverage_values.parquet", engine="pyarrow")
+df = pd.read_parquet("output/mc_leverage_values_monthly.parquet", engine="pyarrow")
 
 # Cast the first (sim) level to int for numeric indexing like df[(1, "min_variance")]
 if isinstance(df.columns, pd.MultiIndex):
@@ -273,7 +315,8 @@ This is unbiased but noisy whenever $T$ is not large relative to the number of a
 
 $$\hat\Sigma = (1-\alpha)\,S + \alpha\,F, \qquad F = \frac{\operatorname{tr}(S)}{N}I_N$$
 
-The shrinkage intensity $\alpha^\* \in [0,1]$ is chosen analytically to minimize expected estimation error $\mathbb{E}\lVert\hat\Sigma - \Sigma\rVert_F^2$ — no manual tuning needed. Larger $\alpha$ pulls the matrix toward equal variances and zero correlation, which is why min-variance degenerates toward equal-weight when assets look statistically similar.
+The shrinkage intensity $\alpha^{*} \in [0,1]$ is chosen analytically to minimize expected estimation error
+$\mathbb{E}\left\|\hat\Sigma - \Sigma\right\|_F^2$ — no manual tuning needed. Larger $\alpha$ pulls the matrix toward equal variances and zero correlation, which is why min-variance degenerates toward equal-weight when assets look statistically similar.
 
 **OAS** (`cov_method='oas'`) is the same shrinkage-toward-identity idea, but with a shrinkage intensity derived under a Gaussian-data assumption instead of Ledoit-Wolf's distribution-free bound; in practice it often shrinks slightly less aggressively.
 
