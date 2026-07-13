@@ -66,39 +66,25 @@ def leverage_backtest(
     if freq is not None and freq not in _FREQ_TO_PERIOD:
         raise ValueError(f"freq must be one of {list(_FREQ_TO_PERIOD)} or None")
 
-    # Compute the underlying portfolio returns from weights and (optionally) returns
     port_rets = portfolio_returns(weights, returns)
 
-    # Compute the daily margin interest rate (EFFR + spread) for each date in port_rets.
-    # If an EFFR scenario path is provided, use it; otherwise fall back to history.
     if effr is None:
         annual_rate = load_margin_rate(port_rets.index, spread=spread)
     else:
-        annual_rate = pd.Series(effr, dtype=float)
-        if len(annual_rate) == len(port_rets.index):
-            annual_rate = pd.Series(annual_rate.to_numpy(), index=port_rets.index)
-        else:
-            annual_rate = annual_rate.reindex(port_rets.index, method="ffill")
-        annual_rate = annual_rate / 100.0 + spread
-    daily_rate = annual_rate / 360.0  # actual/360, IBKR's day-count convention
+        annual_rate = pd.Series(effr.to_numpy(), index=port_rets.index) / 100.0 + spread
+    day_counts = port_rets.index.to_series().diff().dt.days.fillna(1.0)
+    accrual_rate = annual_rate * day_counts / 360.0
 
-    # which dates are "rebalance" dates based on freq (if any)
     due = _rebalance_flags(port_rets.index, freq) if freq is not None else None
-
-    # leverage bands for drift-based rebalancing (only used when freq is None)
     lower_band, upper_band = leverage * (1 - band), leverage * (1 + band)
-
-
     equity = start_value
     gross = leverage * start_value
     debt = gross - equity
 
     rows = []
     for dt in port_rets.index:
-        # 1) underlying assets move gross exposure
         gross *= 1.0 + port_rets.loc[dt]
-        # 2) margin debt accrues interest daily, eating into equity
-        debt *= 1.0 + daily_rate.loc[dt]
+        debt *= 1.0 + accrual_rate.loc[dt]
         equity = gross - debt
 
         if equity <= 0:
@@ -108,7 +94,6 @@ def leverage_backtest(
         forced = current_leverage > hard_cap
         scheduled = due.loc[dt] if due is not None else False
         
-        # drift-based rebalancing (only used when freq is None)
         drifted = freq is None and not (lower_band <= current_leverage <= upper_band)
 
         rebalanced = bool(forced or scheduled or drifted)

@@ -17,12 +17,6 @@ def covariance(returns: pd.DataFrame) -> pd.DataFrame:
 
 
 def covariance_shrunk(returns: pd.DataFrame) -> pd.DataFrame:
-    if returns is None or returns.shape[0] == 0:
-        raise ValueError(
-            f"No return observations provided to covariance_shrunk (shape={None if returns is None else returns.shape})."
-            " Check the requested date window and source data files."
-        )
-
     lw = LedoitWolf().fit(returns)
     return pd.DataFrame(lw.covariance_, index=returns.columns, columns=returns.columns)
 
@@ -42,19 +36,28 @@ def quantiles_df(
 
     Returns a Series keyed by quantile labels plus mean/min/max/std for the final row.
     """
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        raise ValueError("df must be a non-empty DataFrame")
-
-    terminal = pd.to_numeric(df.iloc[-1], errors="coerce").dropna()
-    if terminal.empty:
-        raise ValueError("df must contain numeric terminal simulation values")
+    terminal = df.iloc[-1]
 
     result = pd.Series(dtype=float)
     for q in quantiles:
-        result[f"q{int(q * 100):02d}"] = float(terminal.quantile(q))
+        # round quantiles to nearest integer (avoid truncation)
+        qval = float(terminal.quantile(q))
+        result[f"q{int(q * 100):02d}"] = int(round(qval))
 
-    result["mean"] = float(terminal.mean())
-    result["min"] = float(terminal.min())
-    result["max"] = float(terminal.max())
-    result["std"] = float(terminal.std())
+    # add CAGR and max drawdown metrics
+    result["cagr"] = round(float((terminal.iloc[-1] / terminal.iloc[0]) ** (1 / (len(terminal) / 252)) - 1), 4)
+    result["max_drawdown"] = round(float((df / df.cummax()).min().min() - 1), 4)
+
+
+    result["mean"] = int(round(terminal.mean()))
+    result["min"] = int(round(terminal.min()))
+    result["max"] = int(round(terminal.max()))
+
+    # Keep terminal distribution std (not a volatility measure)
+    result["terminal_std"] = round(float(terminal.std()),3)
+
+    returns = df.pct_change().dropna(how="all")
+    per_sim_annualized = returns.std(ddof=1) * np.sqrt(252)
+    result["ann_std_median"] = round(float(per_sim_annualized.median()),3)
+    result["ann_std_mean"] = round(float(per_sim_annualized.mean()),3)
     return result

@@ -6,15 +6,14 @@ import pandas as pd
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
-from helpers.fetch import load_data
 import matplotlib.pyplot as plt
 from sklearn.manifold import MDS
-# use pyplot's get_cmap to avoid relying on the cm module implementation
+
+from helpers.fetch import load_data
 
 
 def cluster_select_representatives_from_csv(
     universe_csv_path: str | Path,
-    data_dir: str | Path = "data",
     n_clusters: Optional[int] = None,
     distance_metric: str = "1-abs_corr",
     linkage_method: str = "average",
@@ -26,7 +25,6 @@ def cluster_select_representatives_from_csv(
 
     Inputs:
     - universe_csv_path: CSV where column 1 is ticker and column 2 is AUM in millions USD.
-    - data_dir: folder containing ticker CSV files with 'date' and 'adj close' columns.
     - n_clusters: optional number of clusters.
     - distance_metric: '1-abs_corr' or '1-corr'.
     - linkage_method: hierarchical clustering linkage method.
@@ -39,10 +37,6 @@ def cluster_select_representatives_from_csv(
     """
     # Load the ticker-to-AUM universe mapping.
     universe = pd.read_csv(universe_csv_path)
-    if universe.shape[1] < 2:
-        raise ValueError("Universe CSV must have at least two columns: ticker and AUM.")
-
-    # Standardize the first two columns and clean data
     universe = universe.iloc[:, :2].copy()
     universe.columns = ["ticker", "aum_millions"]
     universe["ticker"] = universe["ticker"].astype(str).str.strip().str.upper()
@@ -51,42 +45,22 @@ def cluster_select_representatives_from_csv(
     # Build a ticker-to-AUM map, clean data
     aum: Dict[str, float] = dict(zip(universe["ticker"], universe["aum_millions"]))
 
-    # Load or update adjusted-close price histories using the shared fetch helper.
-    prices_by_ticker: Dict[str, pd.Series] = {}
     end_date = pd.Timestamp.today().strftime("%Y-%m-%d")
-    
     start_date = (pd.Timestamp.today() - pd.DateOffset(years=min_history_years + 5)).strftime("%Y-%m-%d")
-
-    for ticker in universe["ticker"]:
-        try:
-            # use function in fetch.py to load data from csv locally of YF
-            df_prices = load_data(ticker, start_date, end_date)
-        except Exception:
-            continue
-
-        if "adj close" not in df_prices.columns:
-            continue
-
-        series = df_prices["adj close"].dropna().rename(ticker)
-        if len(series) > 0:
-            prices_by_ticker[ticker] = series
+    prices_by_ticker = {
+        ticker: load_data(ticker, start_date, end_date)["adj close"].rename(ticker)
+        for ticker in universe["ticker"]
+    }
 
     # Filter out ETFs with less than the required history.
     min_calendar_days = int(min_history_years * 365)
     min_observations = int(min_history_years * 252)
-    kept_tickers: List[str] = []
-    for ticker, series in prices_by_ticker.items():
-        if len(series) < min_observations:
-            continue
-        if (series.index.max() - series.index.min()).days < min_calendar_days:
-            continue
-        
-        # if everything ok: keep the ticker and append it to the kept_tickers list
-        kept_tickers.append(ticker)
-
-    # Stop early if nothing survives the history filter.
-    if not kept_tickers:
-        raise ValueError(f"No ETFs have at least {min_history_years} years of history.")
+    kept_tickers = [
+        ticker
+        for ticker, series in prices_by_ticker.items()
+        if len(series) >= min_observations
+        and (series.index.max() - series.index.min()).days >= min_calendar_days
+    ]
 
     # Return the only ticker directly if just one survives.
     if len(kept_tickers) == 1:
@@ -96,13 +70,8 @@ def cluster_select_representatives_from_csv(
     prices = pd.concat([prices_by_ticker[ticker] for ticker in kept_tickers], axis=1, join="inner")
     prices.columns = kept_tickers
 
-    # Compute daily simple returns.
     returns = prices.pct_change().dropna(how="any")
-    if returns.shape[0] < 2:
-        raise ValueError("Not enough common return observations after alignment.")
-
-    # Compute the ETF correlation matrix.
-    corr = returns.corr().fillna(0.0)
+    corr = returns.corr()
 
     # Convert correlations into a distance matrix.
     if distance_metric == "1-corr":
@@ -112,11 +81,7 @@ def cluster_select_representatives_from_csv(
     else:
         raise ValueError("distance_metric must be '1-abs_corr' or '1-corr'.")
 
-    # Ensure the distance matrix is valid for hierarchical clustering.
-    # sets the diagonal to zero to ensure that self-distance is zero
     np.fill_diagonal(dist_matrix, 0.0)
-    
-    # Convert the square distance matrix to condensed form for linkage function.
     condensed_dist = squareform(dist_matrix, checks=False)
 
     # Run hierarchical clustering.
@@ -174,10 +139,10 @@ def visualize_clusters(
     if corr is None:
         if returns is None:
             raise ValueError("Provide either 'corr' or 'returns' to compute embedding")
-        corr = returns.corr().reindex(index=tickers, columns=tickers).fillna(0.0)
+        corr = returns.corr().reindex(index=tickers, columns=tickers)
 
     # Ensure correlation matrix covers all tickers in the clusters
-    corr = corr.reindex(index=tickers, columns=tickers).fillna(0.0)
+    corr = corr.reindex(index=tickers, columns=tickers)
 
     if distance_metric == "1-corr":
         dist = 1.0 - corr.values
