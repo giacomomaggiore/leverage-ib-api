@@ -49,6 +49,7 @@ def leverage_backtest(
     band: float = 0.10,       # rebalance early if leverage drifts +/-10% from target (only used when freq is None)
     hard_cap: float = 4.0,    # IBKR Reg T ceiling; forces a rebalance regardless of freq/band
     spread: float = 0.01,     # markup over EFFR approximating IBKR's real borrow rate
+    portfolio_return_series: pd.Series | None = None,
 ) -> pd.DataFrame:
     """
     Simulate leverage `leverage` applied to the strategy defined by `weights`.
@@ -58,20 +59,25 @@ def leverage_backtest(
     - `freq` is None: whenever leverage drifts outside [leverage*(1-band), leverage*(1+band)].
     In both cases, a breach of `hard_cap` forces an immediate rebalance (margin call).
 
-    Output: DataFrame indexed by date with columns
-    ['portfolio_value', 'gross_exposure', 'debt', 'leverage', 'margin_rate', 'rebalanced'].
+    A non-positive equity event liquidates the account. The event row and all later
+    rows remain at zero so Monte Carlo aggregation includes ruined paths.
     """
     if leverage <= 1.0:
         raise ValueError("leverage must be > 1.0 to represent a margin loan")
     if freq is not None and freq not in _FREQ_TO_PERIOD:
         raise ValueError(f"freq must be one of {list(_FREQ_TO_PERIOD)} or None")
 
-    port_rets = portfolio_returns(weights, returns)
+    if portfolio_return_series is None:
+        port_rets = portfolio_returns(weights, returns)
+    else:
+        port_rets = portfolio_return_series.astype(float).sort_index()
 
     if effr is None:
         annual_rate = load_margin_rate(port_rets.index, spread=spread)
     else:
-        annual_rate = pd.Series(effr.to_numpy(), index=port_rets.index) / 100.0 + spread
+        annual_rate = effr.astype(float).reindex(port_rets.index).ffill() / 100.0 + spread
+    if annual_rate.isna().any():
+        raise ValueError("Missing EFFR for one or more leveraged return dates")
     day_counts = port_rets.index.to_series().diff().dt.days.fillna(1.0)
     accrual_rate = annual_rate * day_counts / 360.0
 
@@ -82,13 +88,23 @@ def leverage_backtest(
     debt = gross - equity
 
     rows = []
+    ruined = False
     for dt in port_rets.index:
+        if ruined:
+            rows.append((dt, 0.0, 0.0, 0.0, float("nan"), annual_rate.loc[dt], False, True))
+            continue
+
         gross *= 1.0 + port_rets.loc[dt]
         debt *= 1.0 + accrual_rate.loc[dt]
         equity = gross - debt
 
         if equity <= 0:
-            raise ValueError(f"Portfolio wiped out on {dt.date()} (equity <= 0) — margin call could not be met")
+            ruined = True
+            equity = 0.0
+            gross = 0.0
+            debt = 0.0
+            rows.append((dt, equity, gross, debt, float("nan"), annual_rate.loc[dt], False, True))
+            continue
 
         current_leverage = gross / equity
         forced = current_leverage > hard_cap
@@ -100,10 +116,11 @@ def leverage_backtest(
         if rebalanced:
             gross = leverage * equity
             debt = gross - equity
+            current_leverage = leverage
 
-        rows.append((dt, equity, gross, debt, current_leverage, annual_rate.loc[dt], rebalanced))
+        rows.append((dt, equity, gross, debt, current_leverage, annual_rate.loc[dt], rebalanced, False))
 
     return pd.DataFrame(
         rows,
-        columns=["date", "portfolio_value", "gross_exposure", "debt", "leverage", "margin_rate", "rebalanced"],
+        columns=["date", "portfolio_value", "gross_exposure", "debt", "leverage", "margin_rate", "rebalanced", "ruined"],
     ).set_index("date")

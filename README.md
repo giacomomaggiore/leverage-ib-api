@@ -1,399 +1,267 @@
 Leverage Portfolio
-===================
+==================
 
-Research pipeline that builds, backtests, and stress-tests a leveraged long-only ETF portfolio. Four allocation strategies are compared; the best performer is meant to be run live via IB Gateway (`ib_insync` is in `requirements.txt`, but the execution module is not implemented yet — everything below is backtest/research only).
+Research pipeline for a leveraged, long-only ETF portfolio. It selects a small ETF universe, builds portfolios, backtests them, and stress-tests them with Monte Carlo simulation.
 
----
+- Research and backtesting only.
+- Live execution through IB Gateway is not implemented.
 
 Strategy
 --------
-Four candidate portfolios, rebalanced periodically over the same ETF universe:
 
-- **Min-variance** — minimizes portfolio volatility (PyPortfolioOpt).
-- **Max-Sharpe** — maximizes expected return per unit of risk.
-- **Market-cap** — 100% VT (global market-cap-weighted equities), used as a passive benchmark.
-- **Equal-weight (1/N)** — naive diversification benchmark.
+The same ETF universe is used for four periodically rebalanced portfolios:
 
-Target leverage is **1.7x**, applied uniformly to whichever strategy is chosen. Rebalancing happens either on a fixed calendar schedule (e.g. monthly) or early if realized leverage drifts more than **±10%** from target — because leverage moves against you faster on drawdowns than it helps on rallies (a losing day shrinks equity while debt stays fixed, pushing leverage up).
+- **Min-variance:** lowest estimated volatility.
+- **Max-Sharpe:** highest estimated excess return per unit of risk.
+- **Market-cap:** 100% VT, used as a passive benchmark.
+- **Equal-weight:** equal allocation to each selected ETF.
 
----
+The default research configuration uses **2.0x target leverage**. It can rebalance on a calendar schedule or when realized leverage moves outside a tolerance band. Losses raise leverage because debt remains while equity falls; gains reduce it.
 
-Repository Structure
----------------------
+Pipeline
+--------
 
-### `helpers/fetch.py`
-Reads cached adjusted-close prices.
-- `load_data(ticker, start, end)` — reads and slices `data/{ticker}.csv`. Every requested CSV is expected to exist and contain valid `adj close` data.
-- `common_window(tickers)` — returns the widest `(start, end)` date range that is covered by *every* ticker's CSV, useful for picking a backtest window that all assets can support.
+1. Select liquid, long-history ETF representatives from correlation clusters.
+2. Estimate rolling portfolio weights and run an unlevered historical backtest.
+3. Apply margin financing and leverage-rebalancing rules.
+4. Generate bootstrap or parametric return paths.
+5. Rebuild portfolios on each path and compare terminal values, risk, and drawdowns.
 
-### `helpers/stats.py`
-Small statistics building blocks used across the codebase.
-- `log_returns(prices)` — log price differences, the return convention used for covariance estimation.
-- `sharpe(prices, rf, periods)` — annualized Sharpe ratio of a single price series.
-- `covariance(returns)` — plain sample covariance matrix.
-- `covariance_shrunk(returns)` — Ledoit-Wolf shrinkage covariance (via scikit-learn), more stable than the sample covariance when history is short relative to the number of assets.
 
-### `helpers/portfolio.py`
-Turns price history into portfolio weights.
-- `min_variance(tickers, as_of, timeframe_years, cov_method, ...)` — pulls a lookback window of returns, estimates a covariance matrix, and solves for the lowest-volatility long-only portfolio with PyPortfolioOpt.
-- `max_sharpe(tickers, as_of, timeframe_years, cov_method, ...)` — same setup, but solves the maximum-Sharpe objective directly. Solver failures surface as errors instead of silently changing the strategy objective.
-- `_compute_covariance(returns, method, params)` — shared annualized covariance estimator behind both optimizers; supports `shrunk` (Ledoit-Wolf), `empirical` (sample), `oas` (Oracle Approximating Shrinkage), `ewma` (recency-weighted), and `factor` (PCA-based) methods, plus an optional diagonal jitter for numerical stability.
-- `build_portfolios(tickers, start, end, lookback_years, freq, ...)` — end-to-end historical pipeline: fetches the preceding lookback history, then starts allocating only after that warm-up period.
-- `build_portfolios_from_prices(prices, start, end, lookback_years, freq, ...)` — the core rebalancing loop. At every rebalance date it takes the available rolling lookback window, recomputes min-variance and max-Sharpe weights, sets `market_cap` to 100% VT, and sets `equal_weight` to 1/N, then forward-fills each schedule into a daily weights DataFrame. Monte Carlo calls use the same function but initially have only the simulated path's short, expanding history.
+Project Layout
+--------------
 
-### `helpers/backtest.py`
-- `portfolio_returns(weights, returns)` — forward-fills a daily weights DataFrame onto return dates and computes the weighted daily return series. If `returns` isn't supplied, it loads historical prices for the weight columns and derives returns itself. A weight decided using date $t$ is applied from the next return observation, preventing same-day look-ahead. Missing return columns are dropped and surviving weights are renormalized. Shared by `backtest_portfolio` and `leverage_backtest`.
-- `backtest_portfolio(weights, start_value, returns)` — compounds `portfolio_returns` into a portfolio value series (unlevered, no margin loan).
+- `main.ipynb`: end-to-end workflow and result analysis.
+- `helpers/fetch.py`: cached prices and synthetic history.
+- `helpers/clustering.py`: correlation clustering and ETF selection.
+- `helpers/portfolio.py`: rolling portfolio construction.
+- `helpers/backtest.py`: unlevered backtest.
+- `helpers/leverage.py`: margin and leverage simulation.
+- `helpers/montecarlo.py`: parametric and bootstrap simulation.
+- `helpers/stats.py`: return, covariance, and summary helpers.
+- `data/`: cached prices, ETF universe, and EFFR data.
+- `output/`: generated Parquet results.
 
-### `helpers/leverage.py`
-Simulates a margin-loan-financed leveraged portfolio, modeled on IBKR's Reg T margin mechanics.
-- `load_margin_rate(index, spread)` — daily annualized margin borrow rate for each date in `index`: FRED EFFR (`data/FRED_EFFR.csv`) plus a `spread` approximating IBKR's real tiered markup over the benchmark rate (EFFR alone understates actual borrowing cost).
-- `leverage_backtest(weights, leverage, start_value, returns, freq, band, hard_cap, spread)` — the core simulation. Each trading observation: gross exposure moves with the weighted return of the underlying assets (`portfolio_returns`), while margin debt accrues the annual rate over the elapsed calendar days using actual/360, and equity is the residual (`gross_exposure - debt`). Gross exposure is reset to `leverage × equity` (a rebalance) when:
-  - `freq` is set to `'daily'`, `'weekly'`, or `'monthly'` — on the first trading day of each new period; or
-  - `freq=None` — as soon as realized leverage drifts outside `[leverage×(1-band), leverage×(1+band)]` (default band ±10%, matching the target/band described below).
-  - Independently of either mode, a `hard_cap` breach (default 4.0, IBKR's approximate Reg T ceiling) forces an immediate rebalance, modeling a margin call.
-  - Raises if equity is wiped out (`equity <= 0`) rather than silently returning nonsense leverage.
-  - Returns a DataFrame indexed by date with columns `portfolio_value, gross_exposure, debt, leverage, margin_rate, rebalanced`. On rebalancing days, `leverage` is measured before the reset while gross exposure and debt are reported after it.
+The default run uses a three-year optimization window, a separate 20-year simulation history, 60-day moving blocks, and a five-year simulation horizon. Historical optimization uses date-aligned FRED EFFR as the risk-free rate. Bootstrap paths sample asset returns and EFFR jointly.
 
-### `helpers/montecarlo.py`
-Stress-tests the strategies against simulated futures instead of the one realized history.
-- `simulate_parametric(tickers, n_days, n_sims, lookback_years, seed)` — draws daily returns from a multivariate normal distribution fit to historical mean/covariance. Assumes returns are well-described by a Gaussian — fast, but understates fat tails and crash correlation.
-- `simulate_bootstrap(tickers, n_days, n_sims, lookback_years, block_size, seed)` — resamples actual historical daily returns instead of assuming a distribution. With `block_size` set, it resamples contiguous blocks (moving-block bootstrap) to preserve autocorrelation/volatility clustering; without it, it's an IID resample.
-- `apply_backtest_to_simulations(weights, simulations, start_value, hold)` — backtests a **fixed** weight vector (last or time-averaged from `weights`) across many simulated paths — use this to see how a static allocation performs under randomized markets.
-- `rebalance_on_simulation(sim_returns, lookback_years, freq, which, ...)` — prepends a historical return window, compounds the combined history into synthetic prices, then reruns `build_portfolios_from_prices`. The first simulated allocation therefore has the requested full lookback. A `market_cap` simulation requires a `VT` return column.
-- `apply_rebalanced_backtest_to_simulations(simulations, ...)` — batch version of the function above, one `(weights, values)` pair per simulation.
-- `simulate_and_backtest_portfolios(tickers, n_days, n_sims, method, ...)` — simulates paths (parametric or bootstrap), rebuilds all four strategies on each path, and returns one combined DataFrame with a `(sim, strategy)` column MultiIndex.
-- `leverage_backtest_on_simulation(sim_returns, ..., which, leverage, ...)` — builds dynamic weights on a single simulated path and runs the leveraged backtest (uses the simulated EFFR path if present). Useful when you want both the weight schedule and the full leverage state for diagnostics.
-- `save_simulations_parquet(values, path, engine)` — persists a DataFrame with `(sim, strategy)` MultiIndex columns to Parquet. For compatibility the `sim` level is written as strings; when reading back, cast to integers if you want numeric indexing (see examples below).
+Optimized assets use configurable 10%-40% bounds by default. The same bounds apply to min-variance and max-Sharpe. `max_sharpe_sensitivity.csv` compares historical-mean, EMA, and equal expected-return assumptions; equal expected returns remove noisy cross-asset return ranking.
 
-### `helpers/clustering.py`
-Shrinks the ETF universe before optimization, so the optimizer isn't fed near-duplicate assets (e.g. an aggregate bond ETF alongside its own sleeve constituents), which would make the covariance matrix ill-conditioned.
-- `cluster_select_representatives_from_csv(universe_csv_path, data_dir, n_clusters, ...)` — loads `data/etf_universe.csv` (ticker + AUM), filters out ETFs with too little price history, computes a correlation-based distance between the survivors, runs hierarchical clustering, and keeps the largest-AUM (most liquid) ETF from each cluster as its representative. The current implementation loads through `helpers.fetch.DATA_DIR`; its `data_dir` argument is not yet applied.
-- `visualize_clusters(clusters, returns, ...)` — projects the correlation-distance matrix into 2D with MDS (multi-dimensional scaling) and scatter-plots tickers colored by cluster, so you can visually sanity-check which ETFs got grouped together.
+If no bounded portfolio has an expected return above the estimated risk-free rate, max-Sharpe is undefined. The implementation then uses the same capped min-variance solution instead of deleting the simulation path. This conservative fallback is economically interpretable: when every feasible risky mix has non-positive estimated excess return, the return forecast contains no usable Sharpe-ranking signal.
 
-### `main.ipynb`
-The runnable, end-to-end walkthrough: cluster the universe → build all four portfolios over the historical window → backtest and compare them → run bootstrap Monte Carlo → export unlevered simulation results to `output/mc_values.parquet` and leveraged Monte Carlo results by rebalance mode.
+Synthetic Pre-Inception History
+-------------------------------
 
-There are dedicated cells for both unlevered and leveraged exports. The leveraged cell simulates paths once, reuses those same paths across `daily`, `weekly`, `monthly`, and band-based rebalancing, and saves one Parquet file per mode so the results are directly comparable.
+Some ETFs do not have the 20-year history required for clustering. A longer-history proxy extends the missing period while preserving the ETF's observed prices after inception.
 
-### `data/`
-- `etf_universe.csv` — the candidate ETF universe with AUM (in millions USD), used by the clustering step to break ties.
-- `{ticker}.csv` — one valid file per ticker with `date` and `adj close` columns.
-- `FRED_EFFR.csv` — daily Effective Federal Funds Rate (percent) from FRED, used by `helpers/leverage.py` as the margin-loan benchmark rate.
+- Fund proxies already include their management fee, so no extra adjustment is applied.
+- Raw indexes and futures do not include fund costs, so the ETF's daily TER drag is subtracted.
+- The synthetic series is rebased to equal the ETF price at the splice date. Real observations are never changed.
 
-### `output/`
-Generated artifacts (Parquet exports of Monte Carlo runs); not checked in as source data.
-- `mc_values.parquet` — unlevered Monte Carlo values for all four strategies.
-- `mc_leverage_values_daily.parquet`, `mc_leverage_values_weekly.parquet`, `mc_leverage_values_monthly.parquet`, `mc_leverage_values_band.parquet` — leveraged Monte Carlo values for each leverage rebalancing mode.
+For an ETF with first real observation $t_0$, proxy return $r_t^{proxy}$, and annual TER:
 
----
+$$P_t^{synthetic}=P_{t_0}^{ETF}\prod_{s=t+1}^{t_0}\frac{1}{1+r_s^{proxy}-\text{TER}/252}, \qquad t<t_0$$
+
+| ETF | Proxy | Extension | Limitation |
+|---|---|---|---|
+| `AGG`, `BND` | `VBMFX` | 1986 onward | Broad US aggregate-bond proxy. |
+| `VOO` | `VFINX` | 1980 onward | Same S&P 500 benchmark. |
+| `HYG` | `VWEHX` | 1980 onward | Similar, not identical, high-yield exposure. |
+| `VNQ` | `VGSIX` | 1996 onward | US REIT proxy. |
+| `EMLC` | `PREMX` | 1994 onward | USD EM debt differs from local-currency debt. |
+| `GLD` | `GC=F` | 2000 onward | Gold futures; GLD TER is deducted. |
+| `GSG` | `^SPGSCI` | 1984 onward | Excludes collateral yield. |
+| `SGOV` | `BIL`, then `EFFR_CASH` | 2000 onward | Chained cash proxy. |
+| `VNQI` | `CSRSX` | 1991 onward | International real-estate proxy. |
+| `PFF` | `PREFX` | 2000 onward | Open-end preferred-stock proxy. |
+| `IEMG` | `VEIEX` | 1994 onward | Emerging-markets equity proxy. |
+| `VT` | `VTSMX` 55% + `VGTSX` 45% | 1996 onward | Static US/ex-US split is approximate. |
+
+`DBMF` and `QAI` have no suitable long-history proxy and are excluded by the history threshold. `N_CLUSTERS=5` selects one large-AUM representative from each broad correlation cluster. Raising it makes the universe more granular; lowering it merges more exposures.
 
 Covariance Estimators
-----------------------
-`cov_method` on `min_variance`/`max_sharpe`/`build_portfolios*` controls how the covariance matrix is estimated from returns:
+---------------------
 
-| Method | Idea | Best for |
+The optimizer estimates a covariance matrix $\Sigma$ from returns. Its quality materially affects portfolio weights.
+
+| Method | Idea | Useful when |
 |---|---|---|
-| `shrunk` | Ledoit-Wolf: blend sample covariance with a scaled-identity target | Default for standalone `min_variance` and `max_sharpe`; stable with minimal tuning |
-| `empirical` | Plain sample covariance, no regularization | Long history relative to number of assets |
-| `oas` | Oracle Approximating Shrinkage — an alternative shrinkage intensity to Ledoit-Wolf | Default for `build_portfolios*`; robust when `shrunk` looks too uniform |
-| `ewma` | Exponentially weighted, recent data counts more (`cov_params={'span': s}`) | Adapting quickly to a regime change |
-| `factor` | PCA factor model (`cov_params={'n_factors': k}`) | Many assets, few independent risk drivers |
+| `shrunk` | Ledoit-Wolf shrinkage toward a scaled identity matrix | Stable general-purpose estimate. |
+| `empirical` | Plain sample covariance | History is long relative to assets. |
+| `oas` | Oracle Approximating Shrinkage | Less aggressive shrinkage. |
+| `ewma` | Recent returns receive more weight | Volatility regimes may have changed. |
+| `factor` | PCA factor covariance model | Many assets share few risk drivers. |
 
-If min-variance keeps returning equal weights, the shrinkage is likely washing out real correlation structure — try `empirical`, `oas`, or `ewma`, or reduce clustering redundancy in the universe first.
+If min-variance repeatedly returns equal weights, shrinkage may be suppressing meaningful correlation differences. Try `empirical`, `oas`, or `ewma`, or reduce redundant assets before optimization.
 
 ### Why Max-Sharpe Can Resemble Min-Variance
 
-Max-Sharpe is not a pure highest-return portfolio. It maximizes expected excess return per unit of volatility:
+Max-Sharpe maximizes expected excess return per unit of volatility:
 
-$$\max_w \frac{\mu^\top w - r_f}{\sqrt{w^\top \Sigma w}}$$
+$$\max_w\frac{\mu^\top w-r_f}{\sqrt{w^\top\Sigma w}}$$
 
-Min-variance ignores expected return and minimizes portfolio variance:
+Min-variance ignores expected returns and minimizes total variance:
 
-$$\min_w w^\top \Sigma w$$
+$$\min_w w^\top\Sigma w$$
 
-In rolling historical windows, the expected-return estimate $\mu$ is often much noisier than the covariance estimate $\Sigma$. When the return signal is weak, unstable, or not large enough to compensate for risk, the Max-Sharpe optimizer is mostly governed by the same covariance matrix as min-variance. With long-only constraints and a shrinkage covariance estimator, both optimizers can therefore choose very similar defensive allocations.
+Expected returns $\mu$ are usually much noisier than covariance estimates $\Sigma$. If the estimated return advantage is weak or unstable, Max-Sharpe is driven mainly by the same covariance structure as min-variance. The model uses date-aligned EFFR for $r_f$, preventing cash-like ETFs from appearing to have excess return simply because the risk-free rate was set to zero.
 
-The implementation solves the Max-Sharpe objective directly. If the solver cannot solve the problem, it raises rather than silently substituting a different portfolio. To test whether the similarity is structural, compare the weight distance between `portfolios["min_variance"]` and `portfolios["max_sharpe"]`, then vary `cov_method` (`empirical`, `oas`, `ewma`) or `lookback_years`.
+Modelling Limits
+---------------
 
-### Current Modelling Limitations
-
-The results are research diagnostics, not implementation-ready performance estimates. In particular:
-
-- **Execution and costs**: weights are lagged by one return observation, but the model still excludes transaction costs, bid-ask spreads, taxes, and turnover constraints.
-- **Rate paths and financing**: bootstrap asset returns retain sampled contemporaneous EFFR observations, but block boundaries can create rate-level jumps; parametric asset returns and EFFR changes are simulated separately. Interest accrues over elapsed calendar days using actual/360, but the rate spread remains a simplified approximation of broker pricing.
-- **Clustering**: the default $1-|\rho|$ distance treats positive and negative correlations as equally redundant. For a long-only portfolio, a negatively correlated ETF can be valuable diversification; use `distance_metric="1-corr"` when preserving such hedges matters.
-
----
+- **Trading costs:** weights are lagged one return observation, but transaction costs, bid-ask spreads, taxes, and turnover limits are excluded.
+- **Rates:** EFFR is used as both the optimizer's risk-free rate and the margin-rate benchmark. Bootstrap block boundaries can create rate jumps; parametric asset and rate paths remain simulated separately.
+- **Failed paths:** optimizer failures are reported in `run_config.json`. Equity wipeouts are retained at zero and included in terminal and ruin statistics.
+- **Clustering:** $1-|\rho|$ treats positive and negative correlation as equally redundant. Use $1-\rho$ when negatively correlated assets should remain distinct diversifiers.
 
 Leverage Mechanics
--------------------
-At target leverage `L`, gross exposure is `L × equity` and the rest is margin debt. A market move changes exposure before debt is repaid, so leverage drifts every day: a gain *reduces* leverage, a loss *increases* it (leverage compounds losses faster than gains). The ±10% rebalance band exists to catch that drift before it compounds — at `L=1.7`, a single-day portfolio loss of roughly 7% would already breach the band. IBKR's Reg T maintenance margin caps usable leverage around 4x for ETFs, so the 1.7x target with a 1.87x upper band leaves a wide safety margin before a margin call.
+------------------
 
-This is implemented in `helpers/leverage.py` (`leverage_backtest`), which simulates the margin loan day by day rather than just applying a constant multiplier to returns:
+At target leverage $L$, gross exposure is $L\times E$ and debt is $(L-1)\times E$, where $E$ is equity. Market moves affect gross exposure immediately while debt remains outstanding. Therefore a loss raises realized leverage and a gain lowers it.
 
-- **Financing cost**: margin debt accrues daily interest at FRED EFFR plus a `spread` (default 1%, approximating IBKR's tiered markup over the benchmark rate), compounded under an actual/360 day-count — IBKR's own convention. This cost is what actually erodes equity between rebalances; a flat "leverage × return" backtest would miss it entirely.
-- **Rebalance triggers**: either a fixed calendar schedule (`freq='daily'|'weekly'|'monthly'`) or, if no frequency is given, the ±10% drift band described above. A separate `hard_cap` (default 4.0) forces an emergency rebalance if leverage ever breaches it, independent of the normal schedule/band — a proxy for a margin call.
-- Daily rebalancing pins leverage tightly to target (drift is bounded by one day's move); monthly rebalancing can let leverage drift substantially during sustained drawdowns (e.g. leverage rose to ~2.3x on a 1.7x target for VT during the 2022 selloff, under monthly rebalancing) before the next scheduled reset catches it — illustrating why the band exists as a faster backstop than a fixed calendar.
+The margin simulation:
 
-In Monte Carlo backtests, the simulated EFFR path (if present in the simulation as an `EFFR` column) is passed into `leverage_backtest` so financing costs evolve consistently with the simulated rate environment.
+- Accrues debt daily at EFFR plus a configurable broker spread.
+- Uses actual/360 for elapsed calendar days.
+- Resets on daily, weekly, or monthly schedules, or at a configured leverage band.
+- Forces a reset at the hard cap, a simplified margin-call proxy.
+- Liquidates a path at zero if equity becomes non-positive and keeps all later values at zero.
 
----
+Daily resets keep leverage closest to target. Monthly resets allow more drift. A band balances the two by resetting only after a material move. Financing cost reduces equity independently of asset returns and is therefore essential to a leveraged backtest.
 
 Setup
 -----
+
 ```bash
 pip install -r requirements.txt
 jupyter lab main.ipynb
 ```
 
-Quick usage:
-```python
-from helpers.portfolio import build_portfolios
-from helpers.backtest import backtest_portfolio
+Run the notebook from top to bottom. It first clusters the 20-year ETF universe, selects the largest-AUM representative from each cluster, and passes those representatives to the explicit simulation configuration. It then writes results and diagnostics to `output/`.
 
-portfolios = build_portfolios(["VTI", "IEF", "GLD", "VT"], "2015-01-01", "2024-01-01")
-values = backtest_portfolio(portfolios["min_variance"], start_value=10_000)
+For a reproducible non-interactive run:
+
+```bash
+python run_research.py
 ```
 
-```python
-from helpers.montecarlo import simulate_bootstrap, rebalance_on_simulation
+Use `python run_research.py --n-sims 10` for a quick smoke run. The default is 1,000 paths.
 
-sims = simulate_bootstrap(["VTI", "IEF", "GLD", "VT"], n_days=252, n_sims=50, block_size=10, seed=1)
-weights, values = rebalance_on_simulation(sims[0], which="min_variance")
-```
+The command-line runner uses the explicit default universe `VT`, `BND`, `SGOV`, `GLD`, and `GSG`. The notebook recomputes that universe from clustering before each full run. In both cases, the final tickers are stored in `run_config.json`.
 
-```python
-from helpers.portfolio import build_portfolios
-from helpers.leverage import leverage_backtest
+Generated artifacts:
 
-portfolios = build_portfolios(["VTI", "IEF", "GLD", "VT"], "2015-01-01", "2024-01-01")
+- `mc_values_unlevered.parquet`
+- `mc_values_leveraged_daily.parquet`
+- `mc_values_leveraged_weekly.parquet`
+- `mc_values_leveraged_monthly.parquet`
+- `mc_values_leveraged_band.parquet`
+- Matching `summary_*.csv` files
+- `average_weights_by_simulation.csv` and `average_weights_summary.csv`
+- `max_sharpe_sensitivity.csv`
+- `run_config.json`
 
-# Band-based rebalancing (default): resets to 1.7x whenever leverage drifts past +/-10%
-margin = leverage_backtest(portfolios["min_variance"], leverage=1.7, start_value=10_000)
-
-# Calendar-based rebalancing instead of the drift band
-margin_monthly = leverage_backtest(portfolios["min_variance"], leverage=1.7, freq="monthly")
-```
-
-Unlevered Monte Carlo backtests (all four strategies) and Parquet export:
-```python
-from pathlib import Path
-from helpers.montecarlo import simulate_and_backtest_portfolios, save_simulations_parquet
-
-selected_tickers = ["VTI", "IEF", "GLD"]
-
-values = simulate_and_backtest_portfolios(
-    tickers=selected_tickers,
-    n_days=252 * 5,
-    n_sims=50,
-    lookback_years=3,
-    block_size=10,
-    seed=1,
-    method="bootstrap",
-    start_value=10_000.0,
-)
-
-save_simulations_parquet(values, "output/mc_values.parquet", engine="pyarrow")
-```
-
-Leveraged Monte Carlo backtests (all four strategies) and per-frequency Parquet exports:
-```python
-from pathlib import Path
-import pandas as pd
-from helpers.montecarlo import simulate_bootstrap, save_simulations_parquet
-from helpers.portfolio import build_portfolios_from_prices
-from helpers.leverage import leverage_backtest
-
-# Configuration
-selected_tickers = ["VTI", "IEF", "GLD"]
-n_days, n_sims, lookback_years = 252*5, 5, 3
-leverage = 2.0
-lev_rebalance_freq_list = ["daily", "weekly", "monthly", None]
-band, hard_cap, spread = 0.05, 4.0, 0.01
-
-# Ensure VT exists for the market-cap benchmark
-base_tickers = list(dict.fromkeys(selected_tickers))
-sim_tickers = base_tickers.copy()
-if "VT" not in sim_tickers:
-  sim_tickers.append("VT")
-
-# 1) Simulate return paths (includes an EFFR column when available)
-simulations = simulate_bootstrap(
-  sim_tickers,
-  n_days=n_days,
-  n_sims=n_sims,
-  lookback_years=lookback_years,
-  block_size=10,
-  seed=1,
-)
-
-# 2) Rebuild strategies on synthetic prices and run leveraged backtests
-strategies = ["min_variance", "max_sharpe", "market_cap", "equal_weight"]
-for lev_rebalance_freq in lev_rebalance_freq_list:
-  all_values = []
-  for i, sim in enumerate(simulations, start=1):
-    idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), periods=sim.shape[0])
-    effr = sim["EFFR"].copy() if "EFFR" in sim.columns else None
-    if effr is not None:
-      effr.index = idx
-    rets = sim.drop(columns=["EFFR"], errors="ignore").copy()
-    rets.index = idx
-
-    # Optimized/equal-weight portfolios use selected tickers; VT remains available for market_cap returns.
-    prices = (1.0 + rets[base_tickers]).cumprod()
-    weights = build_portfolios_from_prices(prices, start=prices.index.min(), end=prices.index.max(), lookback_years=lookback_years, freq="BMS")
-    for strategy in strategies:
-      lev_df = leverage_backtest(
-        weights[strategy],
-        leverage=leverage,
-        start_value=10_000.0,
-        returns=rets,
-        effr=effr,
-        freq=lev_rebalance_freq,
-        band=band,
-        hard_cap=hard_cap,
-        spread=spread,
-      )
-      all_values.append(lev_df["portfolio_value"].rename((i, strategy)))
-
-  values_df = pd.concat(all_values, axis=1)
-  values_df.columns = pd.MultiIndex.from_tuples(values_df.columns, names=["sim", "strategy"])
-  values_df.index.name = "date"
-  tag = lev_rebalance_freq if lev_rebalance_freq else "band"
-  save_simulations_parquet(values_df, f"output/mc_leverage_values_{tag}.parquet", engine="pyarrow")
-```
-
-Reading and slicing the saved Parquet (note the `sim` level stored as strings):
-```python
-import pandas as pd
-from helpers.stats import quantiles_df
-
-df = pd.read_parquet("output/mc_leverage_values_monthly.parquet", engine="pyarrow")
-
-# Cast the first (sim) level to int for numeric indexing like df[(1, "min_variance")]
-if isinstance(df.columns, pd.MultiIndex):
-  try:
-    df.columns = pd.MultiIndex.from_tuples([(int(sim), strat) for sim, strat in df.columns], names=df.columns.names)
-  except Exception:
-    pass
-
-series_one = df[(1, "min_variance")]
-by_strategy = df.xs("min_variance", level="strategy", axis=1)
-print(quantiles_df(by_strategy))
-```
-
----
+Every summary includes the horizon, trading-day count, starting value, leverage, rebalance mode, history windows, block size, and requested simulation count. CAGR and annualized volatility are conditional on survival because they are undefined after liquidation. Terminal statistics, maximum drawdown, and ruin rate include ruined paths.
 
 Technical Appendix
-===================
-
-Only `sharpe()` (in `helpers/stats.py`) is currently implemented. CAGR, Sortino, and Calmar are documented here as the natural next metrics to add on top of the `values` series returned by `backtest_portfolio` — they all consume the same daily portfolio-value path.
+==================
 
 ### 1. Performance Metrics
 
-Let $E_t$ be portfolio equity (value) at time $t$, and $r_{p,t} = E_t/E_{t-1} - 1$ the daily portfolio return.
+Let $E_t$ be equity at time $t$, and let $r_{p,t}=E_t/E_{t-1}-1$ be the daily portfolio return.
 
-**CAGR** — average annual growth rate, geometric rather than arithmetic because returns compound:
+**CAGR** is the geometric annual growth rate:
 
-$$\text{CAGR} = \left(\frac{E_T}{E_0}\right)^{252/T} - 1$$
+$$\text{CAGR}=\left(\frac{E_T}{E_0}\right)^{252/T}-1$$
 
-where $T$ is the number of trading days in the sample. The exponent $252/T$ annualizes whatever period the backtest actually covers.
+$T$ is the number of trading days. The exponent annualizes the full compounded change rather than averaging daily returns arithmetically.
 
-**Annualized volatility** — standard deviation of daily returns scaled to a yearly horizon by $\sqrt{252}$ (variance scales linearly with time under the IID assumption, so standard deviation scales with its square root):
+**Annualized volatility** scales the standard deviation of daily returns by $\sqrt{252}$:
 
-$$\sigma_p = \sqrt{252}\,\operatorname{std}(r_{p,t})$$
+$$\sigma_p=\sqrt{252}\,\text{std}(r_{p,t})$$
 
-**Sharpe ratio** — excess return per unit of *total* risk. The following is the conventional simple-return definition:
+This scaling assumes variance grows approximately linearly with time. It is a convention, not a guarantee, especially during clustered volatility.
 
-$$\text{Sharpe} = \frac{\mu_p^{\text{ann}} - r_f}{\sigma_p}, \qquad \mu_p^{\text{ann}} = 252\cdot\mathbb{E}[r_{p,t}]$$
+**Sharpe ratio** measures excess return per unit of total volatility:
 
-The current `sharpe()` helper instead uses log returns and subtracts the simple annual risk-free rate as $r_f/252$. That is an approximation to a log-return Sharpe and differs from the formula above, especially for volatile or leveraged paths.
+$$\text{Sharpe}=\frac{\mu_p^{ann}-r_f}{\sigma_p}, \qquad \mu_p^{ann}=252\,\mathbb{E}[r_{p,t}]$$
 
-**Sortino ratio** — same idea, but only penalizes downside deviation, since an investor doesn't mind upside volatility:
+The current helper uses log returns and subtracts $r_f/252$. This approximates a log-return Sharpe and can differ from the simple-return definition, especially for volatile or leveraged portfolios.
 
-$$\text{Sortino} = \frac{\mu_p^{\text{ann}} - r_f}{\sigma_d}, \qquad \sigma_d = \sqrt{252\cdot\mathbb{E}\!\left[\min(r_{p,t} - r_f/252,\,0)^2\right]}$$
+**Sortino ratio** penalizes only downside deviation:
 
-**Maximum drawdown** — worst peak-to-trough decline, the metric leverage most directly threatens:
+$$\text{Sortino}=\frac{\mu_p^{ann}-r_f}{\sigma_d}, \qquad \sigma_d=\sqrt{252\,\mathbb{E}[\min(r_{p,t}-r_f/252,0)^2]}$$
 
-$$\text{MDD} = \min_t\ \frac{E_t - \max_{s \le t} E_s}{\max_{s \le t} E_s}$$
+It distinguishes undesirable downside volatility from positive surprises.
 
-**Calmar ratio** — return earned per unit of worst-case pain, useful for comparing leveraged strategies where volatility alone understates tail risk:
+**Maximum drawdown** is the worst peak-to-trough loss:
 
-$$\text{Calmar} = \frac{\text{CAGR}}{|\text{MDD}|}$$
+$$\text{MDD}=\min_t\frac{E_t-\max_{s\leq t}E_s}{\max_{s\leq t}E_s}$$
 
----
+**Calmar ratio** compares long-run return with the worst observed drawdown:
+
+$$\text{Calmar}=\frac{\text{CAGR}}{|\text{MDD}|}$$
 
 ### 2. Covariance Matrix Theory
 
-The optimizers in `helpers/portfolio.py` need a covariance matrix $\Sigma$ of asset returns; how well $\Sigma$ is estimated determines how trustworthy the resulting weights are.
+With return vector $r_t$, mean $\hat\mu$, and $T$ observations, sample covariance is
 
-**Sample covariance** (`cov_method='empirical'`), with returns $r_t$ and mean $\hat\mu$ over $T$ observations:
+$$S=\frac{1}{T-1}\sum_{t=1}^{T}(r_t-\hat\mu)(r_t-\hat\mu)^\top$$
 
-$$S = \frac{1}{T-1}\sum_{t=1}^{T} (r_t - \hat\mu)(r_t - \hat\mu)^\top$$
+It is unbiased, but noisy when the number of assets is large relative to the available history. Optimization can amplify that noise into unstable or concentrated weights.
 
-This is unbiased but noisy whenever $T$ is not large relative to the number of assets $N$ — with $N$ assets there are $N(N+1)/2$ entries to estimate, and estimation error in $S$ gets amplified by the matrix inversion inside `min_volatility`/`max_sharpe`, producing extreme, unstable weights.
+**Ledoit-Wolf shrinkage** blends $S$ with a scaled identity target:
 
-**Ledoit-Wolf shrinkage** (`cov_method='shrunk'`, the default) fixes this by blending $S$ with a low-variance target $F$ (a scaled identity matrix):
+$$\hat\Sigma=(1-\alpha)S+\alpha F, \qquad F=\frac{\operatorname{tr}(S)}{N}I_N$$
 
-$$\hat\Sigma = (1-\alpha)\,S + \alpha\,F, \qquad F = \frac{\operatorname{tr}(S)}{N}I_N$$
+The analytically selected $\alpha^*\in[0,1]$ minimizes expected squared estimation error $\mathbb{E}\lVert\hat\Sigma-\Sigma\rVert_F^2$. Larger $\alpha$ reduces estimation noise but pulls variances and correlations toward a common structure, sometimes producing equal-weight-like allocations.
 
-The shrinkage intensity $\alpha^{*} \in [0,1]$ is chosen analytically to minimize expected estimation error
-$\mathbb{E}\left\|\hat\Sigma - \Sigma\right\|_F^2$ — no manual tuning needed. Larger $\alpha$ pulls the matrix toward equal variances and zero correlation, which is why min-variance degenerates toward equal-weight when assets look statistically similar.
+**OAS** uses the same shrinkage target with an intensity derived under a Gaussian assumption. It often shrinks slightly less than Ledoit-Wolf.
 
-**OAS** (`cov_method='oas'`) is the same shrinkage-toward-identity idea, but with a shrinkage intensity derived under a Gaussian-data assumption instead of Ledoit-Wolf's distribution-free bound; in practice it often shrinks slightly less aggressively.
+**EWMA** emphasizes recent observations:
 
-**EWMA** (`cov_method='ewma'`) replaces the uniform average in $S$ with exponentially decaying weights $w_t \propto (1-\lambda)\lambda^{T-t}$, so recent observations dominate:
+$$\hat\Sigma_{EWMA}=\sum_t w_t(r_t-\hat\mu)(r_t-\hat\mu)^\top, \qquad w_t\propto(1-\lambda)\lambda^{T-t}$$
 
-$$\hat\Sigma_{\text{EWMA}} = \sum_t w_t\,(r_t-\hat\mu)(r_t-\hat\mu)^\top$$
+It responds faster to regime changes but has higher sampling noise because its effective sample is smaller.
 
-This trades estimation stability for responsiveness — it adapts faster to a new volatility regime, at the cost of being noisier since it effectively uses fewer observations.
+**Factor covariance** represents returns through $k$ common PCA factors plus residual risk:
 
-**Factor model** (`cov_method='factor'`) assumes returns are driven by a small number $k$ of latent factors plus idiosyncratic noise. PCA on demeaned returns $X_0$ gives factor scores $F$ (top-$k$ singular directions) and loadings $B$:
+$$\hat\Sigma=B\Sigma_F B^\top+D$$
 
-$$\hat\Sigma = B\,\Sigma_F\,B^\top + D$$
-
-where $\Sigma_F$ is the ($k\times k$) factor covariance and $D$ is a diagonal of residual (specific) variances. This concentrates estimation effort on the few directions that actually explain co-movement, leaving less noise to estimate elsewhere — useful when $N$ is large relative to $T$.
-
----
+$B$ contains factor loadings, $\Sigma_F$ is factor covariance, and $D$ is diagonal residual variance. This reduces the number of noisy relationships that must be estimated directly.
 
 ### 3. Monte Carlo Theory
 
-Monte Carlo (`helpers/montecarlo.py`) exists because a single historical backtest is one draw from one realized path — it can't tell you how a strategy behaves in futures that didn't happen to occur. Both simulators below produce daily-return paths that feed back into `build_portfolios_from_prices`, so the same rebalancing logic used historically is tested under alternative markets.
+A historical backtest is one realized market path. Monte Carlo generates alternative paths and reruns the allocation process, testing the strategy rather than only a fixed allocation.
 
-**Parametric (Gaussian) simulation** (`simulate_parametric`) assumes daily returns are drawn from a multivariate normal fit to historical mean $\hat\mu$ and covariance $\hat\Sigma$:
+**Parametric simulation** draws daily returns from a fitted multivariate normal distribution:
 
-$$r_t \sim \mathcal{N}(\hat\mu, \hat\Sigma)$$
+$$r_t\sim\mathcal{N}(\hat\mu,\hat\Sigma)$$
 
-This is fast and lets you generate arbitrarily many paths, but real returns have fatter tails and time-varying correlation (correlations tend to spike in crashes) than a Gaussian captures — so parametric MC tends to understate tail risk.
+It is fast and can generate many paths, but Gaussian returns understate fat tails and the tendency of correlations to rise during market stress.
 
-**Bootstrap simulation** (`simulate_bootstrap`) instead resamples actual historical return rows, so the marginal distribution of returns (fat tails and all) is preserved exactly:
+**Bootstrap simulation** resamples observed return rows and therefore retains their empirical marginal distribution.
 
-- *IID bootstrap* (`block_size=None`): sample $T$ rows independently with replacement. This breaks any autocorrelation or volatility clustering present in the original series (each day is treated as unrelated to its neighbors).
-- *Moving-block bootstrap* (`block_size=b`): sample contiguous blocks of $b$ consecutive days instead of single days. Because each block preserves the correlation structure *within* it, this keeps volatility clustering and short-term momentum/mean-reversion patterns roughly intact — a closer proxy to how real markets actually move than the IID version.
+- **IID bootstrap:** samples individual rows independently. It removes serial dependence and volatility clustering.
+- **Moving-block bootstrap:** samples contiguous blocks of length $b$. It approximately preserves short-run autocorrelation and volatility clustering within each block.
 
-**Compounding to prices**: once a simulated return path exists, `rebalance_on_simulation` compounds it into a synthetic price path via $\prod_t (1+r_t)$ starting from 1.0, then reruns the real optimizer/rebalancing pipeline on those synthetic prices — this is what makes the Monte Carlo test the *strategy*, not just the *asset returns*.
+Simulated returns are compounded into prices with $\prod_t(1+r_t)$, then the rolling portfolio construction is run again. This preserves the feedback between market path, estimated parameters, and rebalanced weights.
 
----
+### 4. Multi-Dimensional Scaling Theory
 
-### 4. Multi-Dimensional Scaling (MDS) Theory
+Clustering uses correlation-derived distances, while the visualization needs two-dimensional coordinates. MDS finds coordinates with Euclidean distances close to the original distances.
 
-`visualize_clusters` (in `helpers/clustering.py`) needs to draw tickers as points in 2D even though the only information available is a pairwise distance (correlation-derived, not spatial). MDS finds a low-dimensional embedding whose Euclidean distances best approximate that dissimilarity matrix.
+**Classical MDS** double-centers squared distances $D^{(2)}$:
 
-**Classical (Torgerson) MDS**: given squared distances $D^{(2)}$, double-center it,
+$$B=-\tfrac{1}{2}JD^{(2)}J, \qquad J=I-\tfrac{1}{n}\mathbf{1}\mathbf{1}^\top$$
 
-$$B = -\tfrac{1}{2}J D^{(2)} J, \qquad J = I - \tfrac{1}{n}\mathbf{1}\mathbf{1}^\top$$
+After eigendecomposition $B=V\Lambda V^\top$, the two-dimensional representation is
 
-then eigendecompose $B = V\Lambda V^\top$ and keep the top-$k$ positive eigenpairs:
+$$X=V_k\Lambda_k^{1/2}$$
 
-$$X = V_k \Lambda_k^{1/2}$$
+Double-centering removes the arbitrary origin. Only relative distances matter.
 
-Row $i$ of $X$ is the $k$-dimensional coordinate of ticker $i$. Double-centering removes the arbitrary choice of origin, leaving only relative distances — which is all correlation distance actually encodes.
+**Metric MDS** minimizes embedding stress directly:
 
-**Metric MDS** (what `sklearn.manifold.MDS` uses here) instead solves an optimization problem directly, minimizing the stress between target and embedded distances:
+$$\text{Stress}(X)=\sqrt{\sum_{i<j}\left(d_{ij}-\lVert x_i-x_j\rVert\right)^2}$$
 
-$$\text{Stress}(X) = \sqrt{\sum_{i \lt j}\big(d_{ij} - \lVert x_i - x_j\rVert\big)^2}$$
-
-This is more robust when the distance matrix isn't perfectly Euclidean (e.g. $1-|\rho_{ij}|$ distances don't always satisfy the triangle inequality exactly), which is the case here since correlation distance is only an approximate metric.
-
-**Turning correlation into distance**: the default is $d_{ij} = 1 - |\rho_{ij}|$ (with `1-corr` also available). Absolute correlation treats strongly negative correlation as "close". This can be reasonable when the goal is purely exposure deduplication, but it is not generally appropriate for this long-only strategy: negatively correlated assets are diversification benefits, not substitutes. Use $d_{ij}=1-\rho_{ij}$ when that distinction matters.
+This is useful when the distance matrix is not perfectly Euclidean. The default $d_{ij}=1-|\rho_{ij}|$ treats strong negative correlation as close. For long-only diversification, $d_{ij}=1-\rho_{ij}$ often better preserves negatively correlated hedges.

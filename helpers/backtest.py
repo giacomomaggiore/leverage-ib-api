@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
 from helpers.fetch import load_data
@@ -13,18 +12,18 @@ def portfolio_returns(
 	returns: Optional[pd.DataFrame] = None,
 ) -> pd.Series:
 	"""
-	Compute the day-by-day weighted return of an (unlevered) portfolio.
+	Compute daily returns while holdings drift between target-weight dates.
 
 	Inputs
-	- weights: DataFrame [dates x tickers], daily portfolio weights (sum ~ 1 per row).
-			   A weight decided at date t is applied from the next return observation.
+	- weights: DataFrame [rebalance dates x tickers] of target portfolio weights.
+			   A target decided at date t is applied from the next return observation.
 	- returns: optional DataFrame [dates x tickers] of daily simple returns for the same tickers.
 			   If None, historical returns are built from adjusted-close prices via `load_data`.
 
 	Output
 	- Series of daily weighted returns indexed by business days (intersection of weights/returns dates).
 	"""
-	w = weights.astype(float).fillna(0.0)
+	w = weights.sort_index().astype(float).fillna(0.0)
 
 	# If no returns provided, load historical prices and build returns for these tickers
 	if returns is None:
@@ -39,19 +38,40 @@ def portfolio_returns(
 	else:
 		rets = returns.astype(float)
 
-	rets = rets[w.columns]
+	available = [ticker for ticker in w.columns if ticker in rets.columns]
+	if not available:
+		raise ValueError("weights and returns have no ticker columns in common")
+	w = w[available]
+	rets = rets[available].sort_index()
 
-	# Trade after the close: weights observed on t are applied to the return after t.
-	w_aligned = w.reindex(rets.index, method="ffill").shift(1).fillna(0.0)
+	holdings = None
+	target_position = 0
+	target_dates = w.index
+	daily_returns = []
 
-	# Normalize rows to sum to 1 when possible (avoid division by ~0)
-	row_sums = w_aligned.sum(axis=1).replace(0.0, np.nan)
-	w_norm = w_aligned.div(row_sums, axis=0).fillna(0.0)
+	for return_date, asset_returns in rets.iterrows():
+		new_target_date = None
+		while target_position < len(target_dates) and target_dates[target_position] < return_date:
+			new_target_date = target_dates[target_position]
+			target_position += 1
 
-	# Daily portfolio returns: weighted sum of constituent returns
-	port_rets = (w_norm * rets).sum(axis=1)
-	port_rets.name = "portfolio_return"
-	return port_rets
+		if new_target_date is not None:
+			target = w.loc[new_target_date]
+			target_sum = target.sum()
+			if target_sum <= 0.0:
+				raise ValueError(f"target weights must sum to a positive value on {new_target_date}")
+			portfolio_value = 1.0 if holdings is None else holdings.sum()
+			holdings = portfolio_value * target / target_sum
+
+		if holdings is None:
+			daily_returns.append(0.0)
+			continue
+
+		previous_value = holdings.sum()
+		holdings = holdings * (1.0 + asset_returns)
+		daily_returns.append(holdings.sum() / previous_value - 1.0)
+
+	return pd.Series(daily_returns, index=rets.index, name="portfolio_return")
 
 
 def backtest_portfolio(

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from typing import List, Optional
+import warnings
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from helpers.fetch import load_data
-from helpers.backtest import backtest_portfolio
 from helpers.portfolio import build_portfolios_from_prices
 from pathlib import Path
 
@@ -18,7 +19,7 @@ def _historical_returns(
 	tickers: List[str],
 	start: Optional[str] = None,
 	end: Optional[str] = None,
-	lookback_years: int = 3,
+	lookback_years: int = 20,
 ) -> pd.DataFrame:
 	"""Build historical daily simple returns for given tickers and date range."""
 	if end is None:
@@ -31,7 +32,15 @@ def _historical_returns(
 		axis=1,
 		join="inner",
 	)
-	return prices.pct_change().dropna(how="any")
+	returns = prices.pct_change().dropna(how="any")
+	actual_years = (returns.index.max() - returns.index.min()).days / 365.25
+	if start is not None and actual_years + 0.1 < lookback_years:
+		warnings.warn(
+			f"Requested {lookback_years} years but the common return history contains {actual_years:.1f} years "
+			f"({returns.index.min().date()} to {returns.index.max().date()}).",
+			stacklevel=2,
+		)
+	return returns
 
 
 def _historical_effr() -> pd.Series:
@@ -59,33 +68,33 @@ def _simulate_effr_path(n_days: int, method: str, rng: np.random.Generator) -> p
 
 
 def simulate_parametric(
-    tickers: List[str],
-    n_days: int,
-    n_sims: int = 1000,
-    lookback_years: int = 3,
-    seed: Optional[int] = None,
+	tickers: List[str],
+	n_days: int,
+	n_sims: int = 1000,
+	simulation_history_years: int = 20,
+	seed: Optional[int] = None,
 ) -> List[pd.DataFrame]:
-    """Parametric MC: draw MVN daily returns using μ,Σ from historical returns."""
-    hist = _historical_returns(tickers, lookback_years=lookback_years)
-    mu = hist.mean().to_numpy()
-    cov = hist.cov().to_numpy()
-    rng = np.random.default_rng(seed)
+	"""Draw multivariate-normal daily returns from a historical calibration window."""
+	hist = _historical_returns(tickers, lookback_years=simulation_history_years)
+	mu = hist.mean().to_numpy()
+	cov = hist.cov().to_numpy()
+	rng = np.random.default_rng(seed)
 
-    sims: List[pd.DataFrame] = []
-    for _ in range(int(n_sims)):
-        draws = rng.multivariate_normal(mean=mu, cov=cov, size=int(n_days))
-        df = pd.DataFrame(draws, columns=tickers, index=pd.RangeIndex(n_days))
-        df["EFFR"] = _simulate_effr_path(n_days, method="parametric", rng=rng).to_numpy()
-        sims.append(df)
-    return sims
+	simulations: List[pd.DataFrame] = []
+	for _ in range(int(n_sims)):
+		draws = rng.multivariate_normal(mean=mu, cov=cov, size=int(n_days))
+		simulation = pd.DataFrame(draws, columns=tickers, index=pd.RangeIndex(n_days))
+		simulation["EFFR"] = _simulate_effr_path(n_days, method="parametric", rng=rng).to_numpy()
+		simulations.append(simulation)
+	return simulations
 
 
 def simulate_bootstrap(
     tickers: List[str],
     n_days: int,
     n_sims: int = 1000,
-    lookback_years: int = 3,
-    block_size: Optional[int] = None,
+	simulation_history_years: int = 20,
+	block_size: Optional[int] = 60,
     seed: Optional[int] = None,
 ) -> List[pd.DataFrame]:
 	"""
@@ -95,10 +104,15 @@ def simulate_bootstrap(
 
 	Returns a list of length n_sims; each item is a DataFrame [n_days x tickers].
 	"""
-	hist = _historical_returns(tickers, lookback_years=lookback_years)
+	hist = _historical_returns(tickers, lookback_years=simulation_history_years)
 	effr = _historical_effr().reindex(hist.index, method="ffill")
 	joint = hist.copy()
 	joint["EFFR"] = effr
+	joint = joint.dropna(how="any")
+	if joint.empty:
+		raise ValueError("Asset returns and EFFR have no common simulation history")
+	if block_size and block_size > len(joint):
+		raise ValueError(f"block_size={block_size} exceeds {len(joint)} common history rows")
 
 	rng = np.random.default_rng(seed)
 
@@ -123,250 +137,46 @@ def simulate_bootstrap(
 	return sims
 
 
-def apply_backtest_to_simulations(
-    weights: pd.DataFrame,
-    simulations: List[pd.DataFrame],
-    start_value: float = 10_000.0,
-    hold: str = "last",
-) -> List[pd.Series]:
-	"""
-	For each simulated return path, run the backtest and return the value series.
-
-	- weights: daily weights DataFrame [dates x tickers]. Only the per-ticker allocations are used.
-	- simulations: list of DataFrames [n_days x tickers] with daily simple returns.
-	- hold: 'last' uses the last row of weights (constant through simulation);
-			'mean' uses the time-average of weights (normalized).
-	"""
-	tickers = [ticker for ticker in simulations[0].columns if ticker != "EFFR"]
-
-	if hold == "mean":
-		base_w = weights[tickers].mean(axis=0)
-	else:
-		base_w = weights[tickers].iloc[-1]
-
-	base_w = base_w / base_w.sum()
-
-	results: List[pd.Series] = []
-	for sim in simulations:
-		# Build a constant-weights DataFrame over the simulation horizon
-		W = pd.DataFrame(np.tile(base_w.to_numpy(), (sim.shape[0], 1)), index=sim.index, columns=tickers)
-		values = backtest_portfolio(W, start_value=start_value, returns=sim[tickers])
-		results.append(values)
-	return results
-
-
-def _simulation_weights(
+def simulation_weights(
 	returns: pd.DataFrame,
 	lookback_years: int,
 	freq: str,
-	cov_method: str | None,
-	cov_params: dict | None,
+	cov_method: str | None = None,
+	cov_params: dict | None = None,
 	warmup_returns: pd.DataFrame | None = None,
+	risk_free_rate: float | pd.Series = 0.0,
+	min_weight: float = 0.10,
+	max_weight: float = 0.40,
+	expected_return_method: str = "mean",
 ) -> dict[str, pd.DataFrame]:
 	"""Build weights at the simulation start using a full historical lookback."""
 	if warmup_returns is None:
 		warmup_returns = _historical_returns(list(returns.columns), lookback_years=lookback_years)
-	warmup = warmup_returns[returns.columns]
+	warmup = warmup_returns[returns.columns].copy()
 
 	warmup.index = pd.bdate_range(
 		end=returns.index.min() - pd.offsets.BDay(),
 		periods=warmup.shape[0],
 	)
+	initial_weight_date = returns.index.min() - pd.offsets.BDay()
+	if isinstance(risk_free_rate, pd.Series) and initial_weight_date not in risk_free_rate.index:
+		risk_free_rate = pd.concat(
+			[pd.Series([risk_free_rate.iloc[0]], index=[initial_weight_date]), risk_free_rate]
+		).sort_index()
 	prices = (1.0 + pd.concat([warmup, returns])).cumprod()
 	return build_portfolios_from_prices(
 		prices=prices,
-		start=returns.index.min(),
+		start=initial_weight_date,
 		end=returns.index.max(),
 		lookback_years=lookback_years,
 		freq=freq,
 		cov_method=cov_method,
 		cov_params=cov_params,
+		risk_free_rate=risk_free_rate,
+		min_weight=min_weight,
+		max_weight=max_weight,
+		expected_return_method=expected_return_method,
 	)
-
-
-def rebalance_on_simulation(
-    sim_returns: pd.DataFrame,
-    lookback_years: int = 3,
-    freq: str = "BMS",
-    cov_method: str | None = None,
-    cov_params: dict | None = None,
-    which: str = "min_variance",
-    start_value: float = 10_000.0,
-) -> tuple[pd.DataFrame, pd.Series]:
-	"""
-	Given one simulated return path [n_days x tickers],
-	- build synthetic prices by compounding from 1.0
-	- compute a rebalanced weight schedule using the same logic as historical (lookback, optimization)
-	- run the backtest on the simulated returns using the dynamic weights
-
-	Returns (weights_df, values_series)
-	"""
-	n_days = sim_returns.shape[0]
-	idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), periods=n_days)
-	effr = sim_returns["EFFR"].copy() if "EFFR" in sim_returns.columns else None
-	if effr is not None:
-		effr.index = idx
-	rets = sim_returns.drop(columns=["EFFR"], errors="ignore").copy()
-	rets.index = idx
-
-	# Start with a complete historical window before the first simulated return.
-	weights_dict = _simulation_weights(
-		returns=rets,
-		lookback_years=lookback_years,
-		freq=freq,
-		cov_method=cov_method,
-		cov_params=cov_params,
-	)
-
-	W = weights_dict[which]
-
-	values = backtest_portfolio(W, start_value=start_value, returns=rets)
-	return W, values
-
-
-def leverage_backtest_on_simulation(
-    sim_returns: pd.DataFrame,
-    lookback_years: int = 3,
-    freq: str = "BMS",
-    cov_method: str | None = None,
-    cov_params: dict | None = None,
-    which: str = "min_variance",
-    leverage: float = 2.0,
-    start_value: float = 10_000.0,
-    band: float = 0.05,
-    hard_cap: float = 4.0,
-    spread: float = 0.01,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-	"""Build dynamic weights on one simulation path and run the leveraged backtest."""
-	n_days = sim_returns.shape[0]
-	idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), periods=n_days)
-	effr = sim_returns["EFFR"] if "EFFR" in sim_returns.columns else None
-	rets = sim_returns.drop(columns=["EFFR"], errors="ignore").copy()
-	rets.index = idx
-
-	weights_dict = _simulation_weights(
-		returns=rets,
-		lookback_years=lookback_years,
-		freq=freq,
-		cov_method=cov_method,
-		cov_params=cov_params,
-	)
-
-	W = weights_dict[which]
-
-	from helpers.leverage import leverage_backtest
-
-	values = leverage_backtest(
-		W,
-		leverage=leverage,
-		start_value=start_value,
-		returns=rets,
-		effr=effr,
-		freq=None,
-		band=band,
-		hard_cap=hard_cap,
-		spread=spread,
-	)
-	return W, values
-
-
-def apply_rebalanced_backtest_to_simulations(
-    simulations: list[pd.DataFrame],
-    lookback_years: int = 3,
-    freq: str = "BMS",
-    cov_method: str | None = None,
-    cov_params: dict | None = None,
-    which: str = "min_variance",
-    start_value: float = 10_000.0,
-) -> list[tuple[pd.DataFrame, pd.Series]]:
-	"""
-	For each simulation, compute dynamic weights (as per historical logic) and return (weights, values).
-	"""
-	return [
-		rebalance_on_simulation(
-			sim_returns=sim,
-			lookback_years=lookback_years,
-			freq=freq,
-			cov_method=cov_method,
-			cov_params=cov_params,
-			which=which,
-			start_value=start_value,
-		)
-		for sim in simulations
-	]
-
-
-def simulate_and_backtest_portfolios(
-	tickers: List[str],
-	n_days: int,
-	n_sims: int,
-	lookback_years: int = 3,
-	block_size: int = 10,
-	seed: int = 1,
-	method: str = "parametric",
-	start_value: float = 10_000.0,
-) -> pd.DataFrame:
-	"""
-	Simulate returns, rebuild all portfolios on each path, and return value series.
-
-	Output columns are: sim_1_min_variance, sim_1_max_sharpe, ...
-	"""
-	base_tickers = list(dict.fromkeys(tickers))
-	sim_tickers = base_tickers.copy()
-	if "VT" not in sim_tickers:
-		sim_tickers.append("VT")
-
-	# Run Monte Carlo return simulations.
-	if method == "parametric":
-		simulations = simulate_parametric(
-			sim_tickers,
-			n_days=n_days,
-			n_sims=n_sims,
-			lookback_years=lookback_years,
-			seed=seed,
-		)
-	elif method == "bootstrap":
-		simulations = simulate_bootstrap(
-			sim_tickers,
-			n_days=n_days,
-			n_sims=n_sims,
-			lookback_years=lookback_years,
-			block_size=block_size,
-			seed=seed,
-		)
-	else:
-		raise ValueError("method must be 'parametric' or 'bootstrap'")
-
-	strategies = ["min_variance", "max_sharpe", "equal_weight", "market_cap"]
-	all_values: list[pd.Series] = []
-	warmup_returns = _historical_returns(base_tickers, lookback_years=lookback_years)
-
-	for i, sim in enumerate(simulations, start=1):
-		# Use a business-day index so portfolio rebuilding can use calendar frequencies.
-		idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), periods=sim.shape[0])
-		rets = sim.copy()
-		rets.index = idx
-
-		# Build optimized/equal-weight portfolios from a full historical window.
-		weights = _simulation_weights(
-			returns=rets[base_tickers],
-			lookback_years=lookback_years,
-			freq="BMS",
-			cov_method=None,
-			cov_params=None,
-			warmup_returns=warmup_returns,
-		)
-
-		# Backtest each strategy on the full simulated returns, including VT for market_cap.
-		for strategy in strategies:
-			values = backtest_portfolio(weights[strategy], start_value=start_value, returns=rets)
-			values.name = (i, strategy)  # MultiIndex column (sim, strategy)
-			all_values.append(values)
-
-	df = pd.concat(all_values, axis=1)
-	df.columns = pd.MultiIndex.from_tuples(df.columns, names=["sim", "strategy"])
-	df.index.name = "date"
-	return df
 
 
 def save_simulations_parquet(values: pd.DataFrame, path: str, engine: str | None = None) -> None:
@@ -383,11 +193,95 @@ def save_simulations_parquet(values: pd.DataFrame, path: str, engine: str | None
 	if p.parent and str(p.parent) not in ("", "."):
 		p.parent.mkdir(parents=True, exist_ok=True)
 	try:
-		df.to_parquet(path, compression="snappy", engine=engine)
+		parquet_options = {"engine": engine} if engine is not None else {}
+		df.to_parquet(path, compression="snappy", **parquet_options)
 	except ImportError as e:
 		raise ImportError(
 			"Parquet export requires 'pyarrow' or 'fastparquet'. Install with:\n"
 			"  pip install pyarrow\n"
 			"or:\n  pip install fastparquet"
 		) from e
+
+
+def _terminal_quantile_paths(values: pd.DataFrame, quantile: float) -> pd.DataFrame:
+	"""Select each strategy's complete path nearest its terminal-value quantile."""
+	if not isinstance(values.columns, pd.MultiIndex) or "strategy" not in values.columns.names:
+		raise ValueError("values must have MultiIndex columns including a 'strategy' level")
+	if not 0.0 <= quantile <= 1.0:
+		raise ValueError("quantile must be between 0 and 1")
+
+	selected_paths = {}
+	for strategy in values.columns.get_level_values("strategy").unique():
+		strategy_paths = values.xs(strategy, level="strategy", axis=1)
+		terminal_values = strategy_paths.iloc[-1].dropna()
+		if terminal_values.empty:
+			raise ValueError(f"strategy {strategy!r} has no terminal values")
+		target = terminal_values.quantile(quantile)
+		simulation = (terminal_values - target).abs().idxmin()
+		selected_paths[strategy] = strategy_paths[simulation]
+
+	return pd.DataFrame(selected_paths)
+
+
+def plot_monthly_leverage_comparison(
+	unlevered_values: pd.DataFrame,
+	leveraged_monthly_values: pd.DataFrame,
+	quantile: float = 0.50,
+	title: str | None = None,
+) -> plt.Axes:
+	"""Compare VT unleveraged with monthly 2x equal-weight and max-Sharpe paths."""
+	unlevered_paths = _terminal_quantile_paths(unlevered_values, quantile)
+	leveraged_paths = _terminal_quantile_paths(leveraged_monthly_values, quantile)
+
+	if "market_cap" not in unlevered_paths:
+		raise ValueError("unlevered_values must include the market_cap strategy")
+	missing = {"equal_weight", "max_sharpe"} - set(leveraged_paths.columns)
+	if missing:
+		raise ValueError(f"leveraged_monthly_values is missing strategies: {sorted(missing)}")
+
+	comparison = pd.DataFrame(
+		{
+			"VT unleveraged": unlevered_paths["market_cap"],
+			"Equal weight 2x monthly": leveraged_paths["equal_weight"],
+			"Max Sharpe 2x monthly": leveraged_paths["max_sharpe"],
+		}
+	)
+	comparison.index = pd.RangeIndex(1, len(comparison) + 1, name="Simulation day")
+	quantile_label = "Median" if quantile == 0.50 else f"Q{quantile * 100:02.0f}"
+
+	ax = comparison.plot(figsize=(12, 6))
+	ax.set_xlim(1, len(comparison))
+	ax.set_title(title or f"Terminal-{quantile_label} Simulation Comparison")
+	ax.set_xlabel("Simulation day")
+	ax.set_ylabel("Portfolio value")
+	ax.grid(alpha=0.3)
+	return ax
+
+
+def plot_median_paths(values: pd.DataFrame, title: str | None = None) -> plt.Axes:
+	"""Plot each strategy's complete path nearest the median terminal value."""
+	median_paths = _terminal_quantile_paths(values, 0.50)
+
+	median_paths.index = pd.RangeIndex(1, len(median_paths) + 1, name="Simulation day")
+	ax = median_paths.plot(figsize=(12, 6))
+	ax.set_xlim(1, len(median_paths))
+	ax.set_title(title or "Monte Carlo Terminal-Median Simulation Paths")
+	ax.set_xlabel("Simulation day")
+	ax.set_ylabel("Portfolio value")
+	ax.grid(alpha=0.3)
+	return ax
+
+
+def plot_q01_paths(values: pd.DataFrame, title: str | None = None) -> plt.Axes:
+	"""Plot each strategy's complete path nearest the 1st-percentile terminal value."""
+	q01_paths = _terminal_quantile_paths(values, 0.01)
+
+	q01_paths.index = pd.RangeIndex(1, len(q01_paths) + 1, name="Simulation day")
+	ax = q01_paths.plot(figsize=(12, 6))
+	ax.set_xlim(1, len(q01_paths))
+	ax.set_title(title or "Monte Carlo Terminal-Q01 Simulation Paths")
+	ax.set_xlabel("Simulation day")
+	ax.set_ylabel("Portfolio value")
+	ax.grid(alpha=0.3)
+	return ax
 

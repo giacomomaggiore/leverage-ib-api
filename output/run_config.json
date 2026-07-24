@@ -1,0 +1,39 @@
+{
+  "tickers": [
+    "VT",
+    "BND",
+    "SGOV",
+    "GLD",
+    "GSG"
+  ],
+  "start_value": 100000.0,
+  "simulation_years": 10,
+  "n_sims": 2000,
+  "optimisation_lookback_years": 3,
+  "simulation_history_years": 20,
+  "block_size": 60,
+  "leverage": 2.0,
+  "leverage_rebalance_modes": [
+    "daily",
+    "weekly",
+    "monthly",
+    null
+  ],
+  "band": 0.25,
+  "hard_cap": 4.0,
+  "spread": 0.01,
+  "min_weight": 0.1,
+  "max_weight": 0.4,
+  "cov_method": "oas",
+  "cov_params": {
+    "jitter": 1e-08
+  },
+  "expected_return_method": "mean",
+  "seed": 1,
+  "n_days": 2520,
+  "n_simulations_completed": 2000,
+  "optimizer_failures": [],
+  "actual_simulation_history_start": "2006-07-25",
+  "actual_simulation_history_end": "2026-07-10",
+  "actual_simulation_history_rows": 4903
+}

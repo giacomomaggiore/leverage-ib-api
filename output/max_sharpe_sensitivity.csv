@@ -1,0 +1,16 @@
+expected_return_method,ticker,weight
+mean,BND,0.26589
+mean,GLD,0.1275
+mean,GSG,0.1
+mean,SGOV,0.4
+mean,VT,0.10661
+ema,BND,0.24385
+ema,GLD,0.10872
+ema,GSG,0.1453
+ema,SGOV,0.4
+ema,VT,0.10213
+equal,BND,0.3
+equal,GLD,0.1
+equal,GSG,0.1
+equal,SGOV,0.4
+equal,VT,0.1

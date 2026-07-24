@@ -1,0 +1,11 @@
+selected_ticker,reference_file,fred_series_id,reference_name,return_type,frequency,coverage_start,status,notes
+EMLC,,,,,,,not_available,"No long-history FRED total-return index matches emerging-market local-currency government bonds"
+BND,,,,,,,not_available,"FRED aggregate-bond total-return series starts in 2025 and is shorter than the ETF history"
+AGG,,,,,,,not_available,"FRED aggregate-bond total-return series starts in 2025 and is shorter than the ETF history"
+IEF,,,,,,,not_available,"FRED Treasury total-return series starts in 2025 and is shorter than the ETF history"
+GLD,,,,,,,not_available,"The historical LBMA gold series was removed from FRED; gold-miner indexes are not valid gold proxies"
+VOO,VOO_REFERENCE_INDEX.csv,NASDAQNQUSBLMT,Nasdaq US Large Mid Cap Total Return Index,total_return,daily,2001-03-30,proxy,"Longer US large-cap proxy; not the exact S&P 500 benchmark"
+VNQ,VNQ_REFERENCE_INDEX.csv,NASDAQNQUSB351020LMT,Nasdaq US Real Estate Investment Trusts Large Mid Cap Total Return Index,total_return,daily,2001-03-30,proxy,"Longer US REIT total-return proxy"
+TIP,,,,,,,not_available,"No long-history FRED total-return index sufficiently matches US inflation-linked Treasuries"
+HYG,,,,,,,not_available,"FRED ICE BofA high-yield total-return history is now limited to three years"
+GSG,GSG_REFERENCE_INDEX.csv,PALLFNFINDEXM,Global Price Index of All Commodities,price_index,monthly,1992-01-01,diagnostic_only,"Long history but not total return and not daily; do not insert directly into the daily bootstrap"

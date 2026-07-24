@@ -18,7 +18,7 @@ def cluster_select_representatives_from_csv(
     distance_metric: str = "1-abs_corr",
     linkage_method: str = "average",
     distance_threshold: Optional[float] = None,
-    min_history_years: float = 6.0,
+    min_history_years: float = 20.0,
 ) -> Tuple[List[str], Dict[int, List[str]]]:
     """
     Cluster ETFs by return correlation and select the largest-AUM ETF per cluster.
@@ -29,7 +29,9 @@ def cluster_select_representatives_from_csv(
     - distance_metric: '1-abs_corr' or '1-corr'.
     - linkage_method: hierarchical clustering linkage method.
     - distance_threshold: optional distance cut threshold.
-    - min_history_years: minimum required history length, default 6 years.
+    - min_history_years: minimum required history length, default 20 years. `load_data`
+      transparently uses splice-extended history (see `helpers.fetch.splice_with_proxy`)
+      when available, so this filter counts synthetic pre-inception history too.
 
     Returns:
     - selected: one representative ETF per cluster.
@@ -61,6 +63,9 @@ def cluster_select_representatives_from_csv(
         if len(series) >= min_observations
         and (series.index.max() - series.index.min()).days >= min_calendar_days
     ]
+
+    if not kept_tickers:
+        raise ValueError(f"No tickers have at least {min_history_years:g} years of history")
 
     # Return the only ticker directly if just one survives.
     if len(kept_tickers) == 1:
@@ -115,7 +120,7 @@ def visualize_clusters(
     returns: Optional[pd.DataFrame] = None,
     distance_metric: str = "1-abs_corr",
     method: str = "mds",
-    figsize: Tuple[int, int] = (10, 8),
+    figsize: Tuple[int, int] = (8, 8),
     annotate: bool = True,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """
@@ -152,30 +157,59 @@ def visualize_clusters(
     np.fill_diagonal(dist, 0.0)
 
     if method == "mds":
-        mds = MDS(n_components=2, dissimilarity="precomputed", random_state=0)
+        mds = MDS(n_components=2, metric="precomputed", init="random", random_state=0)
         coords = mds.fit_transform(dist)
     else:
         raise ValueError("Unsupported embedding method: %s" % method)
 
-    fig, ax = plt.subplots(figsize=figsize)
-    cmap = plt.get_cmap("tab20")
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    cmap = plt.get_cmap("tab10")
     labels = [label_of[t] for t in tickers]
     unique_labels = sorted(set(labels))
-    color_for = {lbl: cmap(i % 20) for i, lbl in enumerate(unique_labels)}
+    color_for = {lbl: cmap(i % 10) for i, lbl in enumerate(unique_labels)}
 
-    for t, (x, y) in zip(tickers, coords):
-        lbl = label_of[t]
-        ax.scatter(x, y, color=color_for[lbl], s=70, edgecolors="k", linewidths=0.4)
+    for label_index, lbl in enumerate(unique_labels):
+        member_indexes = [index for index, ticker in enumerate(tickers) if label_of[ticker] == lbl]
+        member_coords = coords[member_indexes]
+        color = color_for[lbl]
+        ax.scatter(
+            member_coords[:, 0],
+            member_coords[:, 1],
+            color=color,
+            s=55,
+            edgecolors="white",
+            linewidths=0.8,
+            alpha=0.9,
+            label=f"Cluster {lbl} ({len(member_indexes)})",
+            zorder=2,
+        )
+
+        centroid = member_coords.mean(axis=0)
+        spread = member_coords.std(axis=0)
+        radius = max(spread.max() * 2.5, 0.03)
+        ax.add_patch(plt.Circle(centroid, radius, color=color, alpha=0.08, linewidth=0, zorder=1))
+
         if annotate:
-            ax.text(x + 1e-6, y + 1e-6, t, fontsize=8)
+            angles = np.linspace(0, 2 * np.pi, len(member_indexes), endpoint=False)
+            for ticker_index, angle in zip(member_indexes, angles + label_index * 0.35):
+                x, y = coords[ticker_index]
+                offset = (10 * np.cos(angle), 10 * np.sin(angle))
+                ax.annotate(
+                    tickers[ticker_index],
+                    (x, y),
+                    xytext=offset,
+                    textcoords="offset points",
+                    fontsize=8,
+                    ha="left" if offset[0] >= 0 else "right",
+                    va="center",
+                    arrowprops={"arrowstyle": "-", "color": "0.5", "lw": 0.5},
+                    zorder=4,
+                )
 
-    # build legend
-    handles = [plt.Line2D([0], [0], marker='o', color='w', label=str(lbl),
-                          markerfacecolor=color_for[lbl], markersize=8, markeredgecolor='k')
-               for lbl in unique_labels]
-    ax.legend(handles=handles, title="cluster", bbox_to_anchor=(1.05, 1), loc='upper left')
-    ax.set_title("Cluster visualization")
-    ax.set_xlabel("dim1")
-    ax.set_ylabel("dim2")
-    plt.tight_layout()
+    ax.legend(title="Cluster (members)", bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+    ax.set_title("Correlation-Based ETF Clusters", pad=12)
+    ax.set_xlabel("MDS dimension 1")
+    ax.set_ylabel("MDS dimension 2")
+    ax.grid(True, color="0.9", linewidth=0.8)
+    ax.set_axisbelow(True)
     return fig, ax
