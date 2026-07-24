@@ -1,12 +1,8 @@
 import numpy as np
 import pandas as pd
-from datetime import date
-from dateutil.relativedelta import relativedelta
-from pypfopt import risk_models, expected_returns
+from pypfopt import expected_returns, risk_models
 from pypfopt.efficient_frontier import EfficientFrontier
 from pypfopt.exceptions import OptimizationError
-
-from helpers.fetch import load_data
 
 
 def _validate_weight_bounds(n_assets: int, min_weight: float, max_weight: float) -> None:
@@ -55,61 +51,6 @@ def _solve_max_sharpe(
         )
         ef.min_volatility()
     return ef.clean_weights()
-
-def _prices(tickers: list[str], as_of: date, timeframe_years: int) -> pd.DataFrame:
-    start = (as_of - relativedelta(years=timeframe_years)).strftime("%Y-%m-%d")
-    end = as_of.strftime("%Y-%m-%d")
-    return pd.concat(
-        [load_data(ticker, start, end)["adj close"].rename(ticker) for ticker in tickers],
-        axis=1,
-        join="inner",
-    )
-
-
-def min_variance(
-    tickers: list[str],
-    as_of: date = None,
-    timeframe_years: int = 3,
-    cov_method: str = "shrunk",  # 'shrunk' | 'empirical' | 'oas' | 'ewma' | 'factor'
-    cov_params: dict | None = None,
-    min_weight: float = 0.10,
-    max_weight: float = 0.40,
-) -> pd.Series:
-    if as_of is None:
-        as_of = date.today()
-
-    prices = _prices(tickers, as_of, timeframe_years)
-    returns = prices.pct_change().dropna(how="any")
-    sigma = _compute_covariance(returns, method=cov_method, params=cov_params)
-    mu = expected_returns.mean_historical_return(prices, frequency=252, log_returns=False)
-    _validate_weight_bounds(len(tickers), min_weight, max_weight)
-    ef = EfficientFrontier(expected_returns=mu, cov_matrix=sigma, weight_bounds=(min_weight, max_weight))
-    ef.min_volatility()
-    return pd.Series(ef.clean_weights()).reindex(tickers, fill_value=0.0)
-
-
-def max_sharpe(
-    tickers: list[str],
-    as_of: date = None,
-    timeframe_years: int = 3,
-    rf: float = 0.0,
-    cov_method: str = "shrunk",  # 'shrunk' | 'empirical' | 'oas' | 'ewma' | 'factor'
-    cov_params: dict | None = None,
-    min_weight: float = 0.10,
-    max_weight: float = 0.40,
-    expected_return_method: str = "mean",
-) -> pd.Series:
-    if as_of is None:
-        as_of = date.today()
-
-    prices = _prices(tickers, as_of, timeframe_years)
-    returns = prices.pct_change().dropna(how="any")
-    sigma = _compute_covariance(returns, method=cov_method, params=cov_params)
-    mu = _expected_returns(prices, method=expected_return_method)
-    _validate_weight_bounds(len(tickers), min_weight, max_weight)
-    return pd.Series(
-        _solve_max_sharpe(mu, sigma, rf=rf, weight_bounds=(min_weight, max_weight))
-    ).reindex(tickers, fill_value=0.0)
 
 
 def _expected_returns(prices: pd.DataFrame, method: str = "mean") -> pd.Series:
@@ -185,48 +126,6 @@ def _compute_covariance(rets: pd.DataFrame, method: str, params: dict | None) ->
     return cov
 
 
-def covariance_diagnostics(sigma: pd.DataFrame) -> pd.Series:
-    """Return annualized asset volatilities implied by an annual covariance matrix."""
-    return pd.Series(np.sqrt(np.diag(sigma)), index=sigma.index, name="annualized_volatility")
-
-
-
-def build_portfolios(
-    tickers,
-    start,
-    end,
-    lookback_years=4,
-    freq="MS",
-    cov_method=None,
-    cov_params=None,
-    risk_free_rate: float | pd.Series = 0.0,
-    min_weight: float = 0.10,
-    max_weight: float = 0.40,
-    expected_return_method: str = "mean",
-):
-    start_ts = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end)
-    load_start = start_ts - pd.DateOffset(years=lookback_years)
-    px = pd.concat(
-        [load_data(ticker, load_start.strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d"))["adj close"].rename(ticker) for ticker in tickers],
-        axis=1,
-        join="inner",
-    ).sort_index()
-    return build_portfolios_from_prices(
-        prices=px,
-        start=start_ts,
-        end=end_ts,
-        lookback_years=lookback_years,
-        freq=freq,
-        cov_method=cov_method,
-        cov_params=cov_params,
-        risk_free_rate=risk_free_rate,
-        min_weight=min_weight,
-        max_weight=max_weight,
-        expected_return_method=expected_return_method,
-    )
-
-
 def build_portfolios_from_prices(
     prices: pd.DataFrame,
     start: str | pd.Timestamp,
@@ -268,7 +167,6 @@ def build_portfolios_from_prices(
 
     tickers = list(px.columns)
     _validate_weight_bounds(len(tickers), min_weight, max_weight)
-    # Ensure VT column exists in weights output for market_cap
     cols = sorted(set(tickers) | {"VT"})
     market_cap_row = pd.Series({ticker: float(ticker == "VT") for ticker in cols})
     equal_weight_row = pd.Series(
@@ -320,15 +218,13 @@ def build_portfolios_from_prices(
             raise ValueError(f"Insufficient price history to build {name} weights")
         return pd.DataFrame(d).T.sort_index()
 
-    static_schedules = {
-        "market_cap": {dt: market_cap_row for dt in rebalance_dates},
-        "equal_weight": {dt: equal_weight_row for dt in rebalance_dates},
-    }
+    market_cap = pd.DataFrame([market_cap_row] * len(rebalance_dates), index=rebalance_dates)
+    equal_weight = pd.DataFrame([equal_weight_row] * len(rebalance_dates), index=rebalance_dates)
 
     return {
         "min_variance": to_schedule(mv, "min_variance"),
         "max_sharpe": to_schedule(ms, "max_sharpe"),
-        "market_cap": to_schedule(static_schedules["market_cap"], "market_cap"),
-        "equal_weight": to_schedule(static_schedules["equal_weight"], "equal_weight"),
+        "market_cap": market_cap,
+        "equal_weight": equal_weight,
     }
     

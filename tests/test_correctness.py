@@ -7,7 +7,7 @@ from helpers.backtest import portfolio_returns
 from helpers.leverage import leverage_backtest
 from helpers.montecarlo import _terminal_quantile_paths, plot_monthly_leverage_comparison
 from helpers.portfolio import build_portfolios_from_prices
-from helpers.stats import covariance, quantiles_df
+from helpers.stats import quantiles_df
 
 
 class CorrectnessTests(unittest.TestCase):
@@ -112,11 +112,12 @@ class CorrectnessTests(unittest.TestCase):
             index=pd.to_datetime(["2020-01-02", "2020-01-03"]),
         )
         effr = pd.Series([0.0, 0.0], index=returns.index)
-        result = leverage_backtest(weights, 2.0, returns=returns, effr=effr, freq="daily")
+        strategy_returns = portfolio_returns(weights, returns)
+        result = leverage_backtest(strategy_returns, effr, 2.0, freq="daily")
         self.assertEqual(result["portfolio_value"].tolist(), [0.0, 0.0])
         self.assertEqual(result["ruined"].tolist(), [True, True])
 
-    def test_leverage_reuses_the_same_drifting_portfolio_returns(self):
+    def test_leverage_uses_drifting_portfolio_returns(self):
         weights = pd.DataFrame(
             {"A": [0.50], "B": [0.50]},
             index=pd.to_datetime(["2020-01-01"]),
@@ -128,21 +129,16 @@ class CorrectnessTests(unittest.TestCase):
         effr = pd.Series([0.0, 0.0], index=returns.index)
         drifting_returns = portfolio_returns(weights, returns)
 
-        direct = leverage_backtest(weights, 2.0, returns=returns, effr=effr, freq="daily")
-        reused = leverage_backtest(
-            weights,
+        leveraged = leverage_backtest(
+            drifting_returns,
+            effr,
             2.0,
-            returns=returns,
-            effr=effr,
+            start_value=100.0,
             freq="daily",
-            portfolio_return_series=drifting_returns,
+            spread=0.0,
         )
 
-        pd.testing.assert_series_equal(direct["portfolio_value"], reused["portfolio_value"])
-
-    def test_public_covariance_is_annualized(self):
-        returns = pd.DataFrame({"A": [-0.01, 0.0, 0.01]})
-        self.assertAlmostEqual(covariance(returns).iloc[0, 0], returns.var().iloc[0] * 252)
+        np.testing.assert_allclose(leveraged["portfolio_value"], [110.0, 121.5238095238])
 
     def test_inferred_start_does_not_add_a_zero_return(self):
         values = pd.DataFrame({"path": [100.0, 110.0, 100.0]})

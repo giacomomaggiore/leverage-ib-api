@@ -1,42 +1,17 @@
-from __future__ import annotations
-
-from typing import Optional
-
 import pandas as pd
-
-from helpers.fetch import load_data
-
 
 def portfolio_returns(
 	weights: pd.DataFrame,
-	returns: Optional[pd.DataFrame] = None,
+	returns: pd.DataFrame,
 ) -> pd.Series:
 	"""
 	Compute daily returns while holdings drift between target-weight dates.
 
-	Inputs
-	- weights: DataFrame [rebalance dates x tickers] of target portfolio weights.
-			   A target decided at date t is applied from the next return observation.
-	- returns: optional DataFrame [dates x tickers] of daily simple returns for the same tickers.
-			   If None, historical returns are built from adjusted-close prices via `load_data`.
-
-	Output
-	- Series of daily weighted returns indexed by business days (intersection of weights/returns dates).
+	A target decided at date t applies from the next return observation. Holdings then
+	compound independently until the next target date, so portfolio weights drift.
 	"""
 	w = weights.sort_index().astype(float).fillna(0.0)
-
-	# If no returns provided, load historical prices and build returns for these tickers
-	if returns is None:
-		start_date = pd.Timestamp(w.index.min()).strftime("%Y-%m-%d")
-		end_date = pd.Timestamp(w.index.max()).strftime("%Y-%m-%d")
-		prices = pd.concat(
-			[load_data(ticker, start_date, end_date)["adj close"].rename(ticker) for ticker in w.columns],
-			axis=1,
-			join="inner",
-		)
-		rets = prices.pct_change().dropna(how="any")
-	else:
-		rets = returns.astype(float)
+	rets = returns.astype(float)
 
 	available = [ticker for ticker in w.columns if ticker in rets.columns]
 	if not available:
@@ -72,20 +47,4 @@ def portfolio_returns(
 		daily_returns.append(holdings.sum() / previous_value - 1.0)
 
 	return pd.Series(daily_returns, index=rets.index, name="portfolio_return")
-
-
-def backtest_portfolio(
-	weights: pd.DataFrame,
-	start_value: float = 10_000.0,
-	returns: Optional[pd.DataFrame] = None,
-) -> pd.Series:
-	"""
-	Compute the day-by-day portfolio value time series given a weights DataFrame.
-
-	See `portfolio_returns` for the meaning of `weights`/`returns`.
-	"""
-	port_rets = portfolio_returns(weights, returns)
-	values = start_value * (1.0 + port_rets).cumprod()
-	values.name = "portfolio_value"
-	return values
 

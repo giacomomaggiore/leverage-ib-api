@@ -86,11 +86,7 @@ def run(config: ResearchConfig, output_dir: Path = Path("output")) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Simulate assets and EFFR jointly so financing conditions share the same history.
-    
-    # retrieve tickers from settings and adds VT
     simulation_tickers = list(dict.fromkeys(config.tickers + ["VT"]))
-    
-    # calls montecarlo helper to simulate bootstrap returns for the tickers
     simulations = simulate_bootstrap(
         simulation_tickers,
         n_days=config.n_days,
@@ -99,8 +95,6 @@ def run(config: ResearchConfig, output_dir: Path = Path("output")) -> None:
         block_size=config.block_size,
         seed=config.seed,
     )
-    
-    # retrieve warmup returns for the tickers to estimate the first simulated allocation
     warmup_returns = _historical_returns(
         config.tickers,
         lookback_years=config.optimisation_lookback_years,
@@ -114,15 +108,10 @@ def run(config: ResearchConfig, output_dir: Path = Path("output")) -> None:
     failures: list[str] = []
 
     for simulation_number, simulation in enumerate(simulations, start=1):
-        
-        # builds a date index for the simulated returns and EFFR
         index = pd.bdate_range("2000-01-03", periods=len(simulation))
-        
-        # splits the simulation into returns and EFFR, setting the index to the date index
         returns = simulation.drop(columns="EFFR").set_axis(index)
         effr = simulation["EFFR"].set_axis(index)
 
-        # Use historical warm-up data to estimate the first simulated allocation.
         try:
             weights = simulation_weights(
                 returns=returns[config.tickers],
@@ -153,25 +142,20 @@ def run(config: ResearchConfig, output_dir: Path = Path("output")) -> None:
             average_weights.index.name = "ticker"
             weight_rows.append(average_weights.reset_index())
 
-            # unlevered backtest is just a simple portfolio backtest with no leverage
             values = config.start_value * (1.0 + strategy_returns).cumprod()
             values.name = "portfolio_value"
             unlevered_paths.append(values.rename((simulation_number, strategy)))
 
-            # Reuse the same weights for each financing and rebalance convention.
-            # computes leveraged portfolio
             for mode in config.leverage_rebalance_modes:
                 leveraged = leverage_backtest(
-                    strategy_weights,
+                    strategy_returns,
+                    effr,
                     leverage=config.leverage,
                     start_value=config.start_value,
-                    returns=returns,
-                    effr=effr,
                     freq=mode,
                     band=config.band,
                     hard_cap=config.hard_cap,
                     spread=config.spread,
-                    portfolio_return_series=strategy_returns,
                 )
                 leveraged_paths[mode].append(
                     leveraged["portfolio_value"].rename((simulation_number, strategy))

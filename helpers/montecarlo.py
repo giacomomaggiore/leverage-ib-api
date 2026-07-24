@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from pathlib import Path
 import warnings
 
 import matplotlib.pyplot as plt
@@ -9,16 +9,15 @@ import pandas as pd
 
 from helpers.fetch import load_data
 from helpers.portfolio import build_portfolios_from_prices
-from pathlib import Path
 
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
 
 def _historical_returns(
-	tickers: List[str],
-	start: Optional[str] = None,
-	end: Optional[str] = None,
+	tickers: list[str],
+	start: str | None = None,
+	end: str | None = None,
 	lookback_years: int = 20,
 ) -> pd.DataFrame:
 	"""Build historical daily simple returns for given tickers and date range."""
@@ -34,7 +33,7 @@ def _historical_returns(
 	)
 	returns = prices.pct_change().dropna(how="any")
 	actual_years = (returns.index.max() - returns.index.min()).days / 365.25
-	if start is not None and actual_years + 0.1 < lookback_years:
+	if actual_years + 0.1 < lookback_years:
 		warnings.warn(
 			f"Requested {lookback_years} years but the common return history contains {actual_years:.1f} years "
 			f"({returns.index.min().date()} to {returns.index.max().date()}).",
@@ -49,54 +48,14 @@ def _historical_effr() -> pd.Series:
 	return effr.sort_index().astype(float)
 
 
-def _simulate_effr_path(n_days: int, method: str, rng: np.random.Generator) -> pd.Series:
-	"""Simulate an EFFR scenario path in percentage points."""
-	effr = _historical_effr()
-	changes = effr.diff().dropna()
-
-	last_level = float(effr.iloc[-1])
-	if method == "bootstrap":
-		draws = rng.choice(changes.to_numpy(), size=int(n_days), replace=True)
-	else:
-		mu = float(changes.mean())
-		sigma = float(changes.std(ddof=1))
-		draws = rng.normal(loc=mu, scale=sigma, size=int(n_days)) if sigma > 0 else np.full(int(n_days), mu)
-
-	path = last_level + np.cumsum(draws)
-	path = np.clip(path, a_min=0.0, a_max=None)
-	return pd.Series(path, name="EFFR")
-
-
-def simulate_parametric(
-	tickers: List[str],
-	n_days: int,
-	n_sims: int = 1000,
-	simulation_history_years: int = 20,
-	seed: Optional[int] = None,
-) -> List[pd.DataFrame]:
-	"""Draw multivariate-normal daily returns from a historical calibration window."""
-	hist = _historical_returns(tickers, lookback_years=simulation_history_years)
-	mu = hist.mean().to_numpy()
-	cov = hist.cov().to_numpy()
-	rng = np.random.default_rng(seed)
-
-	simulations: List[pd.DataFrame] = []
-	for _ in range(int(n_sims)):
-		draws = rng.multivariate_normal(mean=mu, cov=cov, size=int(n_days))
-		simulation = pd.DataFrame(draws, columns=tickers, index=pd.RangeIndex(n_days))
-		simulation["EFFR"] = _simulate_effr_path(n_days, method="parametric", rng=rng).to_numpy()
-		simulations.append(simulation)
-	return simulations
-
-
 def simulate_bootstrap(
-    tickers: List[str],
+    tickers: list[str],
     n_days: int,
     n_sims: int = 1000,
 	simulation_history_years: int = 20,
-	block_size: Optional[int] = 60,
-    seed: Optional[int] = None,
-) -> List[pd.DataFrame]:
+	block_size: int | None = 60,
+    seed: int | None = None,
+) -> list[pd.DataFrame]:
 	"""
 	Bootstrap Monte Carlo on historical daily simple returns.
 	- If block_size is None: IID bootstrap (sample rows with replacement).
@@ -118,22 +77,14 @@ def simulate_bootstrap(
 
 	T = joint.shape[0]
 
-	sims: List[pd.DataFrame] = []
-	if not block_size or block_size <= 1:
-		# IID bootstrap: sample rows with replacement
-		for _ in range(int(n_sims)):
-			idx = rng.integers(low=0, high=T, size=int(n_days))
-			df = joint.iloc[idx].reset_index(drop=True)
-			df.index = pd.RangeIndex(n_days)
-			sims.append(df)
-	else:
-		b = int(block_size)
-		for _ in range(int(n_sims)):
-			starts = rng.integers(0, T - b + 1, size=int(np.ceil(n_days / b)))
-			chunks = [joint.iloc[start : start + b] for start in starts]
-			df = pd.concat(chunks, axis=0).iloc[:n_days].reset_index(drop=True)
-			df.index = pd.RangeIndex(n_days)
-			sims.append(df)
+	sims: list[pd.DataFrame] = []
+	for _ in range(int(n_sims)):
+		if not block_size or block_size <= 1:
+			indexes = rng.integers(0, T, size=int(n_days))
+		else:
+			starts = rng.integers(0, T - block_size + 1, size=int(np.ceil(n_days / block_size)))
+			indexes = np.concatenate([np.arange(start, start + block_size) for start in starts])[:n_days]
+		sims.append(joint.iloc[indexes].reset_index(drop=True))
 	return sims
 
 
@@ -141,17 +92,15 @@ def simulation_weights(
 	returns: pd.DataFrame,
 	lookback_years: int,
 	freq: str,
+	warmup_returns: pd.DataFrame,
 	cov_method: str | None = None,
 	cov_params: dict | None = None,
-	warmup_returns: pd.DataFrame | None = None,
 	risk_free_rate: float | pd.Series = 0.0,
 	min_weight: float = 0.10,
 	max_weight: float = 0.40,
 	expected_return_method: str = "mean",
 ) -> dict[str, pd.DataFrame]:
-	"""Build weights at the simulation start using a full historical lookback."""
-	if warmup_returns is None:
-		warmup_returns = _historical_returns(list(returns.columns), lookback_years=lookback_years)
+	"""Build rolling weights from historical warm-up and simulated returns."""
 	warmup = warmup_returns[returns.columns].copy()
 
 	warmup.index = pd.bdate_range(
@@ -179,28 +128,16 @@ def simulation_weights(
 	)
 
 
-def save_simulations_parquet(values: pd.DataFrame, path: str, engine: str | None = None) -> None:
+def save_simulations_parquet(values: pd.DataFrame, path: str) -> None:
 	"""Save simulation values with Parquet-compatible simulation labels."""
 	df = values.copy()
-	# fastparquet requires every MultiIndex level to be str/bytes (sim is currently int)
 	df.columns = pd.MultiIndex.from_tuples(
 		[(str(sim), strat) for sim, strat in df.columns], names=df.columns.names
 	)
 	if df.index.name is None:
 		df.index.name = "date"
-	# Ensure destination folder exists (relative paths preferred in notebooks)
-	p = Path(path)
-	if p.parent and str(p.parent) not in ("", "."):
-		p.parent.mkdir(parents=True, exist_ok=True)
-	try:
-		parquet_options = {"engine": engine} if engine is not None else {}
-		df.to_parquet(path, compression="snappy", **parquet_options)
-	except ImportError as e:
-		raise ImportError(
-			"Parquet export requires 'pyarrow' or 'fastparquet'. Install with:\n"
-			"  pip install pyarrow\n"
-			"or:\n  pip install fastparquet"
-		) from e
+	Path(path).parent.mkdir(parents=True, exist_ok=True)
+	df.to_parquet(path, compression="snappy")
 
 
 def _terminal_quantile_paths(values: pd.DataFrame, quantile: float) -> pd.DataFrame:
@@ -258,30 +195,4 @@ def plot_monthly_leverage_comparison(
 	return ax
 
 
-def plot_median_paths(values: pd.DataFrame, title: str | None = None) -> plt.Axes:
-	"""Plot each strategy's complete path nearest the median terminal value."""
-	median_paths = _terminal_quantile_paths(values, 0.50)
-
-	median_paths.index = pd.RangeIndex(1, len(median_paths) + 1, name="Simulation day")
-	ax = median_paths.plot(figsize=(12, 6))
-	ax.set_xlim(1, len(median_paths))
-	ax.set_title(title or "Monte Carlo Terminal-Median Simulation Paths")
-	ax.set_xlabel("Simulation day")
-	ax.set_ylabel("Portfolio value")
-	ax.grid(alpha=0.3)
-	return ax
-
-
-def plot_q01_paths(values: pd.DataFrame, title: str | None = None) -> plt.Axes:
-	"""Plot each strategy's complete path nearest the 1st-percentile terminal value."""
-	q01_paths = _terminal_quantile_paths(values, 0.01)
-
-	q01_paths.index = pd.RangeIndex(1, len(q01_paths) + 1, name="Simulation day")
-	ax = q01_paths.plot(figsize=(12, 6))
-	ax.set_xlim(1, len(q01_paths))
-	ax.set_title(title or "Monte Carlo Terminal-Q01 Simulation Paths")
-	ax.set_xlabel("Simulation day")
-	ax.set_ylabel("Portfolio value")
-	ax.grid(alpha=0.3)
-	return ax
 

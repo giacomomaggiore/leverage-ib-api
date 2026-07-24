@@ -34,7 +34,8 @@ Code Map
 - `main.ipynb`: full research run and result charts.
 - `run_research.py`: reproducible command-line run.
 - `helpers/`: clustering, portfolio construction, leverage, simulation, and statistics.
-- `data/` and `output/`: cached inputs and generated results.
+- `data/`: committed CSV inputs. The research code does not download missing data.
+- `output/`: generated paths, summaries, diagnostics, and charts.
 
 The command-line defaults are a three-year optimization window, 20 years of simulation history, 60-day blocks, five simulated years, and 1,000 paths. The notebook deliberately uses a 10-year, 2,000-path configuration. Both use date-aligned FRED EFFR as the risk-free rate and sample asset returns with EFFR jointly.
 
@@ -103,7 +104,7 @@ Modelling Limits
 ---------------
 
 - **Trading costs:** weights are lagged one return observation, but transaction costs, bid-ask spreads, taxes, and turnover limits are excluded.
-- **Rates:** EFFR is used as both the optimizer's risk-free rate and the margin-rate benchmark. Bootstrap block boundaries can create rate jumps; parametric asset and rate paths remain simulated separately.
+- **Rates:** EFFR is used as both the optimizer's risk-free rate and the margin-rate benchmark. Bootstrap block boundaries can create rate jumps.
 - **Failed paths:** optimizer failures are reported in `run_config.json`. Equity wipeouts are retained at zero and included in terminal and ruin statistics.
 - **Clustering:** $1-|\rho|$ treats positive and negative correlation as equally redundant. Use $1-\rho$ when negatively correlated assets should remain distinct diversifiers.
 
@@ -155,25 +156,9 @@ $$\sigma_p=\sqrt{252}\,\text{std}(r_{p,t})$$
 
 This scaling assumes variance grows approximately linearly with time. It is a convention, not a guarantee, especially during clustered volatility.
 
-**Sharpe ratio** measures excess return per unit of total volatility:
-
-$$\text{Sharpe}=\frac{\mu_p^{ann}-r_f}{\sigma_p}, \qquad \mu_p^{ann}=252\,\mathbb{E}[r_{p,t}]$$
-
-The current helper uses log returns and subtracts $r_f/252$. This approximates a log-return Sharpe and can differ from the simple-return definition, especially for volatile or leveraged portfolios.
-
-**Sortino ratio** penalizes only downside deviation:
-
-$$\text{Sortino}=\frac{\mu_p^{ann}-r_f}{\sigma_d}, \qquad \sigma_d=\sqrt{252\,\mathbb{E}[\min(r_{p,t}-r_f/252,0)^2]}$$
-
-It distinguishes undesirable downside volatility from positive surprises.
-
 **Maximum drawdown** is the worst peak-to-trough loss:
 
 $$\text{MDD}=\min_t\frac{E_t-\max_{s\leq t}E_s}{\max_{s\leq t}E_s}$$
-
-**Calmar ratio** compares long-run return with the worst observed drawdown:
-
-$$\text{Calmar}=\frac{\text{CAGR}}{|\text{MDD}|}$$
 
 ### 2. Covariance Matrix Theory
 
@@ -193,7 +178,7 @@ For portfolio weights $w$, the optimizer sees portfolio variance $w^\top\hat\Sig
 
 **Ledoit-Wolf shrinkage** blends $S$ with a scaled identity target:
 
-$$\hat\Sigma=(1-\alpha)S+\alpha F, \qquad F=\frac{\operatorname{tr}(S)}{N}I_N$$
+$$\hat\Sigma=(1-\alpha)S+\alpha F, \qquad F=\frac{\text{tr}(S)}{N}I_N$$
 
 The analytically selected $\alpha^*\in[0,1]$ minimizes expected squared estimation error $\mathbb{E}\lVert\hat\Sigma-\Sigma\rVert_F^2$. Larger $\alpha$ reduces estimation noise but pulls variances and correlations toward a common structure, sometimes producing equal-weight-like allocations.
 
@@ -219,13 +204,7 @@ All covariance estimators should be compared out of sample. A lower in-sample $w
 
 ### 3. Monte Carlo Theory
 
-A historical backtest is one realized market path. Monte Carlo generates alternative paths and reruns the allocation process, testing the strategy rather than only a fixed allocation. The research runner uses the moving-block bootstrap below; the parametric routine is available separately for comparison.
-
-**Parametric simulation** draws daily returns from a fitted multivariate normal distribution:
-
-$$r_t\sim\mathcal{N}(\hat\mu,\hat\Sigma)$$
-
-It is fast and can generate many paths, but Gaussian returns understate fat tails and the tendency of correlations to rise during market stress. In the current parametric helper, asset returns are multivariate-normal while EFFR is simulated independently from historical EFFR changes, so it does not preserve asset-rate dependence.
+A historical backtest is one realized market path. Monte Carlo generates alternative paths and reruns the allocation process, testing the strategy rather than only a fixed allocation. The research runner uses the moving-block bootstrap below.
 
 **Bootstrap simulation** resamples observed return rows and therefore retains their empirical marginal distribution. For each historical date, the runner forms the joint vector
 
@@ -266,6 +245,8 @@ Double-centering removes the arbitrary origin. Only relative distances matter.
 
 **Metric MDS** minimizes embedding stress directly:
 
-$$\text{Stress}(X)=\sqrt{\sum_{i<j}\left(d_{ij}-\lVert x_i-x_j\rVert\right)^2}$$
+$$
+\text{Stress}(X) = \sqrt {  \sum_{i<j}. \left(d_{ij}-\lVert x_i-x_j\rVert \right)^2}
+$$
 
 This is useful when the distance matrix is not perfectly Euclidean. The default $d_{ij}=1-|\rho_{ij}|$ treats strong negative correlation as close. For long-only diversification, $d_{ij}=1-\rho_{ij}$ often better preserves negatively correlated hedges.
