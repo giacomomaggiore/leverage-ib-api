@@ -1,7 +1,7 @@
 Leverage Portfolio
 ==================
 
-Research pipeline for a leveraged, long-only ETF portfolio. It selects a small ETF universe, builds portfolios, backtests them, and stress-tests them with Monte Carlo simulation.
+Research pipeline for a leveraged, long-only ETF portfolio. It selects a small ETF universe, builds rolling portfolios inside simulated market paths, and compares unlevered and margin-financed outcomes.
 
 - Research and backtesting only.
 - Live execution through IB Gateway is not implemented.
@@ -22,27 +22,21 @@ Pipeline
 --------
 
 1. Select liquid, long-history ETF representatives from correlation clusters.
-2. Estimate rolling portfolio weights and run an unlevered historical backtest.
-3. Apply margin financing and leverage-rebalancing rules.
-4. Generate bootstrap or parametric return paths.
-5. Rebuild portfolios on each path and compare terminal values, risk, and drawdowns.
+2. Bootstrap joint asset-return and EFFR paths with 60-day moving blocks.
+3. Estimate monthly portfolio weights from a three-year warm-up and the simulated path.
+4. Apply unlevered and margin-financed portfolio rules to the same returns.
+5. Compare terminal values, CAGR, volatility, drawdown, and liquidation rates.
 
 
-Project Layout
---------------
+Code Map
+--------
 
-- `main.ipynb`: end-to-end workflow and result analysis.
-- `helpers/fetch.py`: cached prices and synthetic history.
-- `helpers/clustering.py`: correlation clustering and ETF selection.
-- `helpers/portfolio.py`: rolling portfolio construction.
-- `helpers/backtest.py`: unlevered backtest.
-- `helpers/leverage.py`: margin and leverage simulation.
-- `helpers/montecarlo.py`: parametric and bootstrap simulation.
-- `helpers/stats.py`: return, covariance, and summary helpers.
-- `data/`: cached prices, ETF universe, and EFFR data.
-- `output/`: generated Parquet results.
+- `main.ipynb`: full research run and result charts.
+- `run_research.py`: reproducible command-line run.
+- `helpers/`: clustering, portfolio construction, leverage, simulation, and statistics.
+- `data/` and `output/`: cached inputs and generated results.
 
-The default run uses a three-year optimization window, a separate 20-year simulation history, 60-day moving blocks, and a five-year simulation horizon. Historical optimization uses date-aligned FRED EFFR as the risk-free rate. Bootstrap paths sample asset returns and EFFR jointly.
+The command-line defaults are a three-year optimization window, 20 years of simulation history, 60-day blocks, five simulated years, and 1,000 paths. The notebook deliberately uses a 10-year, 2,000-path configuration. Both use date-aligned FRED EFFR as the risk-free rate and sample asset returns with EFFR jointly.
 
 Optimized assets use configurable 10%-40% bounds by default. The same bounds apply to min-variance and max-Sharpe. `max_sharpe_sensitivity.csv` compares historical-mean, EMA, and equal expected-return assumptions; equal expected returns remove noisy cross-asset return ranking.
 
@@ -136,31 +130,11 @@ pip install -r requirements.txt
 jupyter lab main.ipynb
 ```
 
-Run the notebook from top to bottom. It first clusters the 20-year ETF universe, selects the largest-AUM representative from each cluster, and passes those representatives to the explicit simulation configuration. It then writes results and diagnostics to `output/`.
-
-For a reproducible non-interactive run:
-
 ```bash
 python run_research.py
 ```
 
-Use `python run_research.py --n-sims 10` for a quick smoke run. The default is 1,000 paths.
-
-The command-line runner uses the explicit default universe `VT`, `BND`, `SGOV`, `GLD`, and `GSG`. The notebook recomputes that universe from clustering before each full run. In both cases, the final tickers are stored in `run_config.json`.
-
-Generated artifacts:
-
-- `mc_values_unlevered.parquet`
-- `mc_values_leveraged_daily.parquet`
-- `mc_values_leveraged_weekly.parquet`
-- `mc_values_leveraged_monthly.parquet`
-- `mc_values_leveraged_band.parquet`
-- Matching `summary_*.csv` files
-- `average_weights_by_simulation.csv` and `average_weights_summary.csv`
-- `max_sharpe_sensitivity.csv`
-- `run_config.json`
-
-Every summary includes the horizon, trading-day count, starting value, leverage, rebalance mode, history windows, block size, and requested simulation count. CAGR and annualized volatility are conditional on survival because they are undefined after liquidation. Terminal statistics, maximum drawdown, and ruin rate include ruined paths.
+The notebook reclusters the universe before every run; the command-line runner uses `VT`, `BND`, `SGOV`, `GLD`, and `GSG`. Results and the exact configuration are written to `output/`, including `summary_*.csv`, path-level Parquet files, weight diagnostics, and `run_config.json`.
 
 Technical Appendix
 ==================
@@ -209,13 +183,21 @@ $$S=\frac{1}{T-1}\sum_{t=1}^{T}(r_t-\hat\mu)(r_t-\hat\mu)^\top$$
 
 It is unbiased, but noisy when the number of assets is large relative to the available history. Optimization can amplify that noise into unstable or concentrated weights.
 
+The implementation starts from daily simple returns and annualizes every covariance estimator:
+
+$$
+\hat\Sigma_{ann}=252\hat\Sigma_{daily}
+$$
+
+For portfolio weights $w$, the optimizer sees portfolio variance $w^\top\hat\Sigma_{ann}w$. Small errors in correlations can therefore change the allocation materially, especially when several assets have similar expected returns or volatility. The 10%-40% weight bounds limit this estimation-error amplification; they do not remove it.
+
 **Ledoit-Wolf shrinkage** blends $S$ with a scaled identity target:
 
 $$\hat\Sigma=(1-\alpha)S+\alpha F, \qquad F=\frac{\operatorname{tr}(S)}{N}I_N$$
 
 The analytically selected $\alpha^*\in[0,1]$ minimizes expected squared estimation error $\mathbb{E}\lVert\hat\Sigma-\Sigma\rVert_F^2$. Larger $\alpha$ reduces estimation noise but pulls variances and correlations toward a common structure, sometimes producing equal-weight-like allocations.
 
-**OAS** uses the same shrinkage target with an intensity derived under a Gaussian assumption. It often shrinks slightly less than Ledoit-Wolf.
+**OAS** uses the same target with an intensity derived under a Gaussian assumption. It often shrinks slightly less than Ledoit-Wolf. OAS is the current default in both the notebook and command-line configuration; an optional positive diagonal jitter is then added to make numerical optimization more stable.
 
 **EWMA** emphasizes recent observations:
 
@@ -223,28 +205,50 @@ $$\hat\Sigma_{EWMA}=\sum_t w_t(r_t-\hat\mu)(r_t-\hat\mu)^\top, \qquad w_t\propto
 
 It responds faster to regime changes but has higher sampling noise because its effective sample is smaller.
 
+With decay parameter $\lambda$, a return observed $k$ days ago receives relative weight $\lambda^k$. A high $\lambda$ remembers more history and changes slowly; a low $\lambda$ adapts quickly but makes the estimate more sensitive to a small number of recent observations. The implementation accepts an EWMA span or alpha, using a 60-day span when neither is supplied.
+
 **Factor covariance** represents returns through $k$ common PCA factors plus residual risk:
 
 $$\hat\Sigma=B\Sigma_F B^\top+D$$
 
 $B$ contains factor loadings, $\Sigma_F$ is factor covariance, and $D$ is diagonal residual variance. This reduces the number of noisy relationships that must be estimated directly.
 
+The PCA implementation estimates $B$ from demeaned daily returns, retains the requested number of components, and sets $D$ from residual variances. It is a statistical compression, not an economic factor model: its factors are chosen to explain variance, not to represent named risks such as equities, duration, or inflation.
+
+All covariance estimators should be compared out of sample. A lower in-sample $w^\top\hat\Sigma w$ is not evidence that the resulting portfolio will have lower realized volatility.
+
 ### 3. Monte Carlo Theory
 
-A historical backtest is one realized market path. Monte Carlo generates alternative paths and reruns the allocation process, testing the strategy rather than only a fixed allocation.
+A historical backtest is one realized market path. Monte Carlo generates alternative paths and reruns the allocation process, testing the strategy rather than only a fixed allocation. The research runner uses the moving-block bootstrap below; the parametric routine is available separately for comparison.
 
 **Parametric simulation** draws daily returns from a fitted multivariate normal distribution:
 
 $$r_t\sim\mathcal{N}(\hat\mu,\hat\Sigma)$$
 
-It is fast and can generate many paths, but Gaussian returns understate fat tails and the tendency of correlations to rise during market stress.
+It is fast and can generate many paths, but Gaussian returns understate fat tails and the tendency of correlations to rise during market stress. In the current parametric helper, asset returns are multivariate-normal while EFFR is simulated independently from historical EFFR changes, so it does not preserve asset-rate dependence.
 
-**Bootstrap simulation** resamples observed return rows and therefore retains their empirical marginal distribution.
+**Bootstrap simulation** resamples observed return rows and therefore retains their empirical marginal distribution. For each historical date, the runner forms the joint vector
+
+$$
+z_t=(r_{VT,t},r_{BND,t},\ldots,r_{GSG,t},EFFR_t)
+$$
+
+after aligning all assets and forward-filling EFFR onto trading days. Sampling this vector jointly preserves the contemporaneous relationship between asset returns and financing rates.
 
 - **IID bootstrap:** samples individual rows independently. It removes serial dependence and volatility clustering.
 - **Moving-block bootstrap:** samples contiguous blocks of length $b$. It approximately preserves short-run autocorrelation and volatility clustering within each block.
 
-Simulated returns are compounded into prices with $\prod_t(1+r_t)$, then the rolling portfolio construction is run again. This preserves the feedback between market path, estimated parameters, and rebalanced weights.
+For a moving-block bootstrap, independent start indices $s_1,s_2,\ldots$ are drawn uniformly from the feasible historical starts. A simulated path is the truncated concatenation
+
+$$
+z^{*}_{1:H}=(z_{s_1:s_1+b-1},z_{s_2:s_2+b-1},\ldots)_{1:H}
+$$
+
+where $H$ is the simulated horizon. The default $b=60$ preserves roughly three trading months at a time, but it breaks dependence at every block boundary. It cannot create shocks, regimes, or cross-asset relationships that are absent from the historical sample.
+
+Asset returns are compounded into synthetic prices with $P_t=P_{t-1}(1+r_t)$. The first monthly allocation uses a separate three-year historical warm-up; later allocations use rolling three-year windows of the combined warm-up and synthetic price history. Each strategy then uses the same simulated portfolio returns across all leverage-reset modes. This pairing isolates the effect of the reset rule from differences in sampled markets.
+
+Bootstrap percentiles describe variation conditional on the chosen history, block length, portfolio rules, and financing model. They are scenario statistics, not probabilities of future outcomes in a fully specified economic model.
 
 ### 4. Multi-Dimensional Scaling Theory
 
