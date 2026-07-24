@@ -229,24 +229,3 @@ Asset returns are compounded into synthetic prices with $P_t=P_{t-1}(1+r_t)$. Th
 
 Bootstrap percentiles describe variation conditional on the chosen history, block length, portfolio rules, and financing model. They are scenario statistics, not probabilities of future outcomes in a fully specified economic model.
 
-### 4. Multi-Dimensional Scaling Theory
-
-Clustering uses correlation-derived distances, while the visualization needs two-dimensional coordinates. MDS finds coordinates with Euclidean distances close to the original distances.
-
-**Classical MDS** double-centers squared distances $D^{(2)}$:
-
-$$B=-\tfrac{1}{2}JD^{(2)}J, \qquad J=I-\tfrac{1}{n}\mathbf{1}\mathbf{1}^\top$$
-
-After eigendecomposition $B=V\Lambda V^\top$, the two-dimensional representation is
-
-$$X=V_k\Lambda_k^{1/2}$$
-
-Double-centering removes the arbitrary origin. Only relative distances matter.
-
-**Metric MDS** minimizes embedding stress directly:
-
-$$
-	\text{Stress}(X) = \sqrt{\sum_{i<j}\left(d_{ij} - \lVert x_i - x_j \rVert\right)^2}
-$$
-
-This is useful when the distance matrix is not perfectly Euclidean. The default $d_{ij}=1-|\rho_{ij}|$ treats strong negative correlation as close. For long-only diversification, $d_{ij}=1-\rho_{ij}$ often better preserves negatively correlated hedges.
