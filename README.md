@@ -246,7 +246,7 @@ Double-centering removes the arbitrary origin. Only relative distances matter.
 **Metric MDS** minimizes embedding stress directly:
 
 $$
-\text{Stress}(X) = \sqrt {  \sum_{i<j}. \left(d_{ij}-\lVert x_i-x_j\rVert \right)^2}
+	ext{Stress}(X) = \sqrt{\sum_{i<j}\left(d_{ij} - \lVert x_i - x_j \rVert\right)^2}
 $$
 
 This is useful when the distance matrix is not perfectly Euclidean. The default $d_{ij}=1-|\rho_{ij}|$ treats strong negative correlation as close. For long-only diversification, $d_{ij}=1-\rho_{ij}$ often better preserves negatively correlated hedges.
