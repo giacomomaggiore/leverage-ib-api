@@ -168,6 +168,8 @@ $$S=\frac{1}{T-1}\sum_{t=1}^{T}(r_t-\hat\mu)(r_t-\hat\mu)^\top$$
 
 It is unbiased, but noisy when the number of assets is large relative to the available history. Optimization can amplify that noise into unstable or concentrated weights.
 
+The important ratio is $N/T$: number of assets divided by return observations. When $N/T$ is not small, sample eigenvalues are too dispersed: the largest eigenvalues tend to be too large and the smallest too small. A minimum-variance optimizer then treats noise as a precise diversification opportunity. This is why covariance estimation often matters more than expected-return estimation in long-only allocation.
+
 The implementation starts from daily simple returns and annualizes every covariance estimator:
 
 $$
@@ -176,13 +178,37 @@ $$
 
 For portfolio weights $w$, the optimizer sees portfolio variance $w^\top\hat\Sigma_{ann}w$. Small errors in correlations can therefore change the allocation materially, especially when several assets have similar expected returns or volatility. The 10%-40% weight bounds limit this estimation-error amplification; they do not remove it.
 
+### Estimator Map
+
+| Method | What changes | Main benefit | Main risk |
+|---|---|---|---|
+| `empirical` | Nothing: uses $S$ directly | Transparent benchmark | Noisy and poorly conditioned with limited history |
+| `shrunk` | Ledoit-Wolf shrinkage toward a common-variance target | Stable default when $T$ is limited | Can flatten genuine covariance differences |
+| `oas` | OAS shrinkage toward the same target | Often effective under near-Gaussian returns | Still depends on a simplified distributional assumption |
+| `ewma` | Gives recent returns more weight | Reacts to changing volatility | Short effective sample and unstable correlations |
+| `factor` | Keeps common PCA factors plus diagonal residual risk | Reduces noisy pairwise estimates | Statistical factors can be hard to interpret |
+
+Use `empirical` as the reference, not automatically as the production choice. Compare its weights and realized out-of-sample risk with `oas` and `shrunk`. A large allocation change caused by a small method change is evidence that the estimate is fragile, not evidence that one optimizer has discovered a superior portfolio.
+
+### Shrinkage Intuition
+
+Shrinkage deliberately accepts some bias to reduce estimation variance:
+
+$$
+\hat\Sigma_{\delta} = (1 - \delta)S + \delta F, \qquad 0 \leq \delta \leq 1.
+$$
+
+Here $F$ is a structured target and $\delta$ is the shrinkage intensity. At $\delta=0$ the estimate is the sample covariance; at $\delta=1$ it is entirely the target. The target used by the implemented Ledoit-Wolf and OAS methods is a scaled identity, so every asset has the same variance and every covariance is zero. It is not a belief that the assets are truly independent. It is an anchor that prevents a short sample from producing extreme correlations with unwarranted confidence.
+
 **Ledoit-Wolf shrinkage** blends $S$ with a scaled identity target:
 
 $$\hat\Sigma=(1-\alpha)S+\alpha F, \qquad F=\frac{\text{tr}(S)}{N}I_N$$
 
-The analytically selected $\alpha^*\in[0,1]$ minimizes expected squared estimation error $\mathbb{E}\lVert\hat\Sigma-\Sigma\rVert_F^2$. Larger $\alpha$ reduces estimation noise but pulls variances and correlations toward a common structure, sometimes producing equal-weight-like allocations.
+The analytically selected $\alpha^*\in[0,1]$ minimizes an estimate of squared error $\mathbb{E}\lVert\hat\Sigma-\Sigma\rVert_F^2$. Larger $\alpha$ reduces estimation noise but pulls variances and correlations toward a common structure, sometimes producing equal-weight-like allocations. The method is attractive because it chooses the intensity from the data rather than requiring a hand-tuned parameter.
 
-**OAS** uses the same target with an intensity derived under a Gaussian assumption. It often shrinks slightly less than Ledoit-Wolf. OAS is the current default in both the notebook and command-line configuration; an optional positive diagonal jitter is then added to make numerical optimization more stable.
+**OAS** uses the same target with an intensity derived under a Gaussian assumption. Its formula is designed for a covariance matrix estimated from normally distributed observations and often shrinks slightly less than Ledoit-Wolf. Daily returns are not normal, so OAS is a regularizer rather than a literal probabilistic model. OAS is the current default in both the notebook and command-line configuration; an optional positive diagonal jitter is then added to make numerical optimization more stable.
+
+Diagonal jitter changes the estimate to $\hat\Sigma + \varepsilon I$. It raises every variance by a small amount and makes the matrix more safely positive definite. It should be tiny relative to daily variance. Large jitter is hidden shrinkage: it can materially change allocations and must be reported as a model choice.
 
 **EWMA** emphasizes recent observations:
 
@@ -192,6 +218,8 @@ It responds faster to regime changes but has higher sampling noise because its e
 
 With decay parameter $\lambda$, a return observed $k$ days ago receives relative weight $\lambda^k$. A high $\lambda$ remembers more history and changes slowly; a low $\lambda$ adapts quickly but makes the estimate more sensitive to a small number of recent observations. The implementation accepts an EWMA span or alpha, using a 60-day span when neither is supplied.
 
+EWMA is a time-weighting method, not a shrinkage estimator. It addresses non-stationarity by discarding information gradually, while Ledoit-Wolf and OAS address cross-sectional estimation noise by pulling the matrix toward a target. In a crisis, EWMA can react quickly to volatility but may estimate correlations from too few effective observations. Combining recency weighting and shrinkage is possible in principle, but this project keeps them as separate study cases.
+
 **Factor covariance** represents returns through $k$ common PCA factors plus residual risk:
 
 $$\hat\Sigma=B\Sigma_F B^\top+D$$
@@ -200,7 +228,15 @@ $B$ contains factor loadings, $\Sigma_F$ is factor covariance, and $D$ is diagon
 
 The PCA implementation estimates $B$ from demeaned daily returns, retains the requested number of components, and sets $D$ from residual variances. It is a statistical compression, not an economic factor model: its factors are chosen to explain variance, not to represent named risks such as equities, duration, or inflation.
 
-All covariance estimators should be compared out of sample. A lower in-sample $w^\top\hat\Sigma w$ is not evidence that the resulting portfolio will have lower realized volatility.
+### Study Procedure and Limits
+
+1. Hold the asset universe, return dates, weight bounds, and rebalance schedule fixed.
+2. Run `empirical`, `shrunk`, and `oas` first; inspect the covariance matrix, implied volatilities, and weights.
+3. Add `ewma` only when a recent-regime hypothesis is economically justified. Vary its span rather than treating 60 days as universal.
+4. Use `factor` with a small number of components and check whether the residual variances remain positive and plausible.
+5. Compare realized risk on a later, untouched period. Lower in-sample $w^\top\hat\Sigma w$ is not evidence of lower future volatility.
+
+All methods assume the past contains useful information about the next rebalance period. They do not solve regime shifts, tail dependence, stale prices, non-synchronous markets, or changes in asset composition. Annualization by 252 is also a convention: it assumes daily variance accumulates roughly linearly through time.
 
 ### 3. Monte Carlo Theory
 
@@ -228,4 +264,52 @@ where $H$ is the simulated horizon. The default $b=60$ preserves roughly three t
 Asset returns are compounded into synthetic prices with $P_t=P_{t-1}(1+r_t)$. The first monthly allocation uses a separate three-year historical warm-up; later allocations use rolling three-year windows of the combined warm-up and synthetic price history. Each strategy then uses the same simulated portfolio returns across all leverage-reset modes. This pairing isolates the effect of the reset rule from differences in sampled markets.
 
 Bootstrap percentiles describe variation conditional on the chosen history, block length, portfolio rules, and financing model. They are scenario statistics, not probabilities of future outcomes in a fully specified economic model.
+
+### 4. Hierarchical Clustering
+
+The notebook reduces a broad ETF universe to a small set of representatives before optimization. It loads the committed price histories, retains funds with sufficient calendar and trading-day history, aligns their prices on common dates, and computes daily simple returns. The resulting correlation matrix is converted to a distance matrix before clustering.
+
+For correlation $\rho_{ij}$, the two implemented distances are
+
+$$
+d_{ij}=1-\rho_{ij}
+\qquad\text{or}\qquad
+d_{ij}=1-|\rho_{ij}|.
+$$
+
+The first treats a correlation of $-0.8$ as distant: the assets may diversify one another. The second treats $-0.8$ and $+0.8$ as equally close because both imply a strong linear relationship. Choose $1-\rho$ for long-only portfolio diversification unless the aim is specifically to remove both positive and negative redundant exposures. The absolute-correlation distance is symmetric and bounded but is not guaranteed to satisfy the triangle inequality, so it should be interpreted as a similarity score rather than a physical distance.
+
+#### Agglomerative Procedure
+
+Hierarchical clustering begins with one cluster per ETF. At each step it merges the two closest clusters and records the merge in a dendrogram. This project uses average linkage:
+
+$$
+D(A,B)=\frac{1}{|A||B|}\sum_{i\in A}\sum_{j\in B}d_{ij}.
+$$
+
+Average linkage is a compromise. Single linkage can chain together assets through a sequence of weak connections; complete linkage favors compact clusters and can split a broad exposure into several groups. Ward linkage is usually inappropriate with a generic correlation distance because its variance-minimization interpretation assumes Euclidean geometry.
+
+`fcluster(..., criterion="maxclust")` cuts the hierarchy into at most the requested number of clusters. Within each cluster, the implementation selects the ETF with the largest reported AUM. AUM is a liquidity and implementation proxy, not evidence that the chosen fund is the most representative return series or has the lowest cost.
+
+#### Practical Workflow
+
+1. Set a history threshold that leaves enough common observations after alignment; 20 calendar years is the notebook default.
+2. Start with a small number of clusters and inspect members, correlations, and the two-dimensional MDS chart.
+3. Check whether each selected representative has the intended exposure, currency, and fund structure.
+4. Repeat the exercise with both distance choices and with nearby cluster counts. Stable groups are more credible than one-off partitions.
+5. Freeze the selection rule before evaluating portfolio results. Selecting clusters after seeing simulated performance is data snooping.
+
+#### Limitations and Diagnostics
+
+Correlation is linear and historical. It can miss asymmetric downside dependence, crisis correlation spikes, duration changes in bond funds, commodity roll effects, and currency hedging differences. Correlations estimated from overlapping ETFs can also reflect shared benchmark construction rather than independent economic risk.
+
+The common-date intersection may shorten the sample substantially when one ETF starts late. Spliced histories improve length but introduce proxy risk: a splice can preserve broad exposure while missing fees, index methodology, taxes, or tracking error. A cluster with one member is not proof of uniqueness; it may simply reflect the available universe or a chosen cut level.
+
+MDS is only a visualization of the distance matrix and does not determine the clusters. Metric MDS chooses two-dimensional coordinates by minimizing
+
+$$
+\operatorname{Stress}(X)=\sqrt{\sum_{i<j}\left(d_{ij}-\lVert x_i-x_j\rVert\right)^2}.
+$$
+
+Low stress means the plot approximately preserves pairwise distances. High stress means nearby or distant points in two dimensions can be misleading; inspect the original correlation matrix and cluster memberships rather than relying on the chart alone.
 
