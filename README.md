@@ -308,7 +308,7 @@ The common-date intersection may shorten the sample substantially when one ETF s
 MDS is only a visualization of the distance matrix and does not determine the clusters. Metric MDS chooses two-dimensional coordinates by minimizing
 
 $$
-\text{Stress}(X)=\sqrt{\sum_{i<j}\left(d_{ij}-\lVert x_i-x_j\rVert\right)^2}.
+\mathrm{Stress}(X)=\sqrt{\sum_{i<j}(d_{ij}-\|x_i-x_j\|)^2}.
 $$
 
 Low stress means the plot approximately preserves pairwise distances. High stress means nearby or distant points in two dimensions can be misleading; inspect the original correlation matrix and cluster memberships rather than relying on the chart alone.
